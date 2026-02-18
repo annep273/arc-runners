@@ -1,0 +1,60 @@
+## Runner scale set values for ARC on OpenShift s390x
+## Image repository/tag are set via --set in the install script
+
+## githubConfigUrl and githubConfigSecret are set via --set in the install script
+githubConfigUrl: ""
+githubConfigSecret: arc-ghes-github-app
+
+minRunners: 0
+maxRunners: 10
+
+runnerGroup: "Default"
+
+## Container mode: "kubernetes" avoids privileged pods (OpenShift-friendly)
+## Use "dind" only if SCC allows privileged containers
+containerMode:
+  type: "kubernetes"
+  kubernetesModeWorkVolumeClaim:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: ""
+    resources:
+      requests:
+        storage: 5Gi
+
+## Runner pod template
+## The chart auto-populates command, env, and volumes for the chosen containerMode
+template:
+  spec:
+    containers:
+      - name: runner
+        image: "ghcr.io/actions/actions-runner:latest"
+        command: ["/home/runner/run.sh"]
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+
+## Listener pod template
+## Leave name as "listener" so the chart applies config correctly
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+## Optional: controller service account reference
+## Uncomment and set if the install script cannot auto-detect the controller SA
+# controllerServiceAccount:
+#   namespace: arc-systems
+#   name: arc-gha-rs-controller
