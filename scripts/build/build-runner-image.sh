@@ -26,6 +26,7 @@ docker buildx build \
   --build-arg RUNNER_VERSION="${RUNNER_VERSION}" \
   --build-arg RUNNER_DOWNLOAD_URL="${RUNNER_DOWNLOAD_URL}" \
   --build-arg RUNNER_DOWNLOAD_SHA256="${RUNNER_DOWNLOAD_SHA256:-}" \
+  --build-arg RUNNER_CONTAINER_HOOKS_VERSION="${RUNNER_CONTAINER_HOOKS_VERSION:-}" \
   --file "${DOCKER_CONTEXT}/Dockerfile" \
   --tag "${IMAGE}" \
   --push \

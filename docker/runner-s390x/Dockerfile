@@ -17,14 +17,25 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:22.04
 
+LABEL org.opencontainers.image.title="ARC Self-Hosted Runner (s390x)" \
+      org.opencontainers.image.description="Non-root GitHub Actions runner for linux/s390x" \
+      org.opencontainers.image.source="https://github.com/actions/actions-runner-controller"
+
 ARG RUNNER_VERSION
 ARG RUNNER_DOWNLOAD_URL
 ARG RUNNER_DOWNLOAD_SHA256
+ARG RUNNER_CONTAINER_HOOKS_VERSION=""
 
+# ── Environment ──────────────────────────────────────────────────────
+# RUNNER_ALLOW_RUNASROOT is intentionally NOT set (non-root policy).
+# RUNNER_MANUALLY_TRAP_SIG + ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT match
+# the official ghcr.io/actions/actions-runner image conventions.
 ENV RUNNER_HOME=/home/runner \
-    RUNNER_ALLOW_RUNASROOT=1 \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    RUNNER_MANUALLY_TRAP_SIG=1 \
+    ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1 \
+    ImageOS=ubuntu22
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -36,6 +47,7 @@ RUN apt-get update && \
       gzip \
       unzip \
       openssl \
+      sudo \
       locales \
       findutils \
       procps \
@@ -49,7 +61,15 @@ RUN apt-get update && \
 RUN test -f /usr/lib/s390x-linux-gnu/libstdc++.so.6.0.30 && \
     echo "libstdc++.so.6.0.30 present → GLIBCXX_3.4.30 confirmed"
 
-RUN useradd -m -d ${RUNNER_HOME} -u 1001 runner
+# Create runner user (UID 1001) and docker group (GID 123) to match
+# the official ARC image layout for DinD socket group ownership.
+RUN adduser --disabled-password --gecos "" --uid 1001 runner \
+    && groupadd docker --gid 123 \
+    && usermod -aG sudo runner \
+    && usermod -aG docker runner \
+    && echo "%sudo ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers \
+    && echo "Defaults env_keep += \"DEBIAN_FRONTEND\"" >> /etc/sudoers
+
 WORKDIR ${RUNNER_HOME}
 
 RUN curl -fL "${RUNNER_DOWNLOAD_URL}" -o runner.tar.gz && \
@@ -60,13 +80,21 @@ RUN curl -fL "${RUNNER_DOWNLOAD_URL}" -o runner.tar.gz && \
     rm -f runner.tar.gz && \
     ./bin/installdependencies.sh || true
 
-# Ensure k8s container hooks are present (bundled in tarball since runner v2.304+)
+# Install runner-container-hooks for Kubernetes mode if version supplied
+RUN if [ -n "${RUNNER_CONTAINER_HOOKS_VERSION}" ]; then \
+      curl -fL -o runner-container-hooks.zip \
+        "https://github.com/actions/runner-container-hooks/releases/download/v${RUNNER_CONTAINER_HOOKS_VERSION}/actions-runner-hooks-k8s-${RUNNER_CONTAINER_HOOKS_VERSION}.zip" && \
+      unzip ./runner-container-hooks.zip -d ./k8s && \
+      rm -f runner-container-hooks.zip; \
+    fi
+
+# Verify k8s hooks exist (bundled in tarball since runner v2.304+, or installed above)
 RUN test -f ${RUNNER_HOME}/k8s/index.js || echo "WARNING: k8s container hooks not found in runner tarball"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && \
     chmod +x ${RUNNER_HOME}/run.sh && \
-    chown -R runner:runner ${RUNNER_HOME}
+    chown -R runner:docker ${RUNNER_HOME}
 
 USER 1001
 ENTRYPOINT ["/home/runner/run.sh"]

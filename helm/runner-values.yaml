@@ -25,11 +25,29 @@ containerMode:
 ## The chart auto-populates command, env, and volumes for the chosen containerMode
 template:
   spec:
+    ## Pod-level security: force non-root, set fs group for volume ownership
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: runner
         image: "ghcr.io/actions/actions-runner:latest"
         command: ["/home/runner/run.sh"]
         imagePullPolicy: IfNotPresent
+        ## Container-level security: drop all caps, no privilege escalation
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false   # runner writes to _diag, _work, etc.
+          capabilities:
+            drop:
+              - ALL
         resources:
           requests:
             cpu: "500m"
@@ -42,9 +60,24 @@ template:
 ## Leave name as "listener" so the chart applies config correctly
 listenerTemplate:
   spec:
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: listener
         imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
         resources:
           requests:
             cpu: "100m"

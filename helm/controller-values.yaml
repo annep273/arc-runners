@@ -10,9 +10,22 @@ serviceAccount:
   annotations: {}
   name: ""
 
-podSecurityContext: {}
+## Pod-level security for the controller
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
-securityContext: {}
+## Container-level security for the controller
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
 
 resources:
   limits:
