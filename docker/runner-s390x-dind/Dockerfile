@@ -18,6 +18,7 @@
 #     podman 3.4.4 from reading unknown TOML keys shipped by Ubuntu 22.04's
 #     containers-common package (e.g. network.network_backend)
 #   - newuidmap/newgidmap neutered (fail silently in enterprise k8s anyway)
+#   - /root/ made accessible for safety (root config path contingency)
 #   - All writable paths under /tmp or /home/runner (no /run access needed)
 #
 # PERMISSION FAILURE COVERAGE:
@@ -30,7 +31,8 @@
 #   ✅ VFS layer extraction    → ignore_chown_errors=true
 #   ⚠️ COPY --chown=user      → Go raw syscall, NOT interceptable*
 #   ⚠️ Alpine/musl images     → shell shims work, LD_PRELOAD may not
-#   ℹ️ newuidmap warnings     → replaced with silent stubs
+#   ℹ️ newuidmap warnings     → replaced with silent stubs (cosmetic only)
+#   ℹ️ --log-level error      → suppresses XDG_RUNTIME_DIR + other warnings
 #
 #   * Workaround: use COPY + RUN chown instead of COPY --chown
 #
@@ -90,6 +92,17 @@ RUN apt-get update && \
 RUN printf '#!/bin/sh\nexit 1\n' > /usr/bin/newuidmap && \
     printf '#!/bin/sh\nexit 1\n' > /usr/bin/newgidmap && \
     chmod 755 /usr/bin/newuidmap /usr/bin/newgidmap
+
+# ── Safety net: make /root/.config/ accessible ──────────────────────
+# Ubuntu backports add containers.conf.d directory scanning. If buildah
+# ever runs as euid=0 in a user namespace (e.g. MaybeReexecUsingUserNamespace
+# succeeds), config loading tries to lstat /root/.config/containers/
+# containers.conf.d. Host UID 1001 (mapped to euid=0) can't traverse /root/
+# (mode 0700, owned by real root) → EACCES → fatal config error.
+# Making /root/ world-traversable (755) prevents this. The directory is
+# empty in our image so there's no security concern.
+RUN chmod 755 /root && \
+    mkdir -p /root/.config/containers/containers.conf.d
 
 # ── CRITICAL: Replace ALL system-level config files ──────────────────
 # Ubuntu 22.04's containers-common package ships config files that may
@@ -368,27 +381,31 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.config && \
     chown -R 1001:0 /home/runner/.local
 
-# ── Wrapper scripts with unshare + explicit CLI flags ─────────────────
+# ── Wrapper scripts with --log-level error + explicit CLI flags ────────
 # Installed at /usr/local/bin/ (PATH priority over /usr/bin/).
 # Source files: wrappers/*.sh (COPY'd into the image).
 #
 # Each wrapper:
 #   1. Repairs user containers.conf symlink (prevents network_backend warning)
 #   2. Exports _CONTAINERS_USERNS_CONFIGURED=1
-#   3. Runs the real binary inside a user namespace via:
-#        unshare --user --map-root-user -- /usr/bin/buildah ...
-#      This makes euid=0 inside the namespace. buildah's
-#      MaybeReexecUsingUserNamespace() then sees euid==0 && IsRootless()
-#      and returns immediately — no newuidmap/newgidmap attempt, no
-#      "error running newgidmap" / "falling back to single mapping" warnings.
-#   4. Adds explicit CLI flags (storage-driver, storage-opt)
+#   3. Runs the real binary with explicit CLI flags:
+#        --log-level error (suppress XDG_RUNTIME_DIR + other warnings)
+#        --storage-driver=vfs
+#        --storage-opt vfs.ignore_chown_errors=true
 #
-# WHY THIS IS NEEDED:
-#   MaybeReexecUsingUserNamespace() checks: euid==0 && IsRootless().
-#   When euid != 0 (our runner UID 1001), it ALWAYS tries to re-exec
-#   with newuidmap, regardless of _CONTAINERS_USERNS_CONFIGURED.
-#   That env var only prevents the RE-EXEC'D CHILD from looping.
-#   Source: containers/storage v1.38.2 pkg/unshare/unshare_linux.go
+# NOTE ON newuidmap WARNINGS:
+#   MaybeReexecUsingUserNamespace() runs BEFORE cobra parses --log-level,
+#   so the 2-3 lines of "error running newgidmap" warnings still appear.
+#   Our newuidmap/newgidmap stubs (exit 1) keep them minimal. The MaybeReexec
+#   attempt fails, buildah continues as euid=1001 in rootless mode, and
+#   the build succeeds using $HOME/.config/containers/ config paths.
+#
+# WHY NOT unshare --user --map-root-user:
+#   Making euid=0 triggers ROOT config discovery in containers/common
+#   (Ubuntu backportred .conf.d scanning). This tries to lstat
+#   /root/.config/containers/containers.conf.d — inaccessible to host
+#   UID 1001 → fatal "permission denied" error at RUN step 13.
+#   Rootless mode (euid=1001) uses $HOME/.config/ which works correctly.
 #
 # We do NOT force --root/--runroot — storage paths come from
 # CONTAINERS_STORAGE_CONF or the workflow's own storage.conf.

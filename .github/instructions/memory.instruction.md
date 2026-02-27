@@ -573,6 +573,7 @@ func MaybeReexecUsingUserNamespace(evenForRoot bool) {
 
 ### Image pushed
 - `docker.io/annepdevops/actions-runner-dind:0.1.9-s390x` — v0.1.9, unshare user namespace wrappers. Digest: `sha256:0d6921189ba1316260619b21506bcd5f3e89d4bef3ffd0d13abb0e1938220067`.
+- **NOTE**: v0.1.9 introduced a REGRESSION — `unshare --user --map-root-user` made euid=0, triggering ROOT config paths → `lstat /root/.config/containers/containers.conf.d: permission denied` → fatal error at RUN step. Reverted in v0.1.10.
 
 ### Files updated
 - `docker/runner-s390x-dind/wrappers/buildah-wrapper.sh` — added unshare, removed --default-mounts-file, detailed comments
@@ -582,6 +583,121 @@ func MaybeReexecUsingUserNamespace(evenForRoot bool) {
 - `.env.example` — `IMAGE_TAG=0.1.9-s390x`
 - `docs/test-dind-pod.yaml` — image tag bumped to v0.1.9
 - `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.9
+
+## DinD Rootless Fixes (Phase 12 — v0.1.10, revert unshare + --log-level error)
+
+### Problem
+v0.1.9 introduced a REGRESSION. The `unshare --user --map-root-user` wrappers made buildah run as euid=0, which triggered ROOT config discovery paths in containers/common. Ubuntu 22.04's backported containers-common adds `.conf.d` directory scanning that tries to lstat `/root/.config/containers/containers.conf.d`. Since the real host UID is 1001 (mapped to euid=0 in the namespace), and `/root/` is mode 0700 owned by real root, `lstat` returns EACCES:
+
+```
+time="..." level=error msg="failed to setup From and Build flags: failed to get container config: finding config on system: lstat /root/.config/containers/containers.conf.d: permission denied"
+error building at STEP "RUN mvn clean package...": exit status 1
+```
+
+STEPs 1-12 succeeded (FROM, COPY, LABEL, ENV — no OCI runtime needed). STEP 13 (RUN) failed because it triggers config loading for runtime setup.
+
+### Root cause analysis (DEFINITIVE)
+
+**Why v0.1.8 worked but v0.1.9 didn't — the MaybeReexec FALLBACK is the key:**
+
+In v0.1.8 (no unshare wrapper):
+1. buildah starts as euid=1001
+2. `MaybeReexecUsingUserNamespace()` runs → tries newuidmap (stubs exit 1) → tries direct uid_map write → ALSO FAILS in enterprise k8s (SELinux/CRI-O)
+3. MaybeReexec catches the error, logs debug, and RETURNS WITHOUT RE-EXECUTING
+4. buildah continues running as plain euid=1001 (rootless mode)
+5. `customConfigFile()` → `unshare.IsRootless()` → euid != 0 → rootless path → `$HOME/.config/containers/` → works
+6. Build succeeds as rootless
+
+In v0.1.9 (with unshare wrapper):
+1. `unshare --user --map-root-user` creates namespace → euid=0
+2. `MaybeReexecUsingUserNamespace()` → euid==0 && IsRootless() → returns immediately (good!)
+3. But now ALL config loading uses ROOT paths (euid=0)
+4. Ubuntu backported `.conf.d` scanning → tries `/root/.config/containers/containers.conf.d` → EACCES
+5. Fatal error at RUN step
+
+**The critical insight:** In v0.1.8, MaybeReexec COMPLETELY FAILS, and buildah runs as euid=1001 rootless. This is the CORRECT behavior. The 2-3 lines of newuidmap warnings are cosmetic — they come from the failed MaybeReexec attempt.
+
+### Why --log-level error cannot suppress MaybeReexec warnings
+
+From buildah v1.23.1 `cmd/buildah/main.go`:
+```go
+func main() {
+    if buildah.InitReexec() { return }  // ← MaybeReexec runs HERE
+    rootCmd.Execute()  // ← cobra parses --log-level here (in before())
+}
+```
+
+MaybeReexecUsingUserNamespace() runs BEFORE cobra parses any flags. At this point, logrus level is the default ("warn"). The newuidmap warnings (`logrus.Warnf`) print before `--log-level` is applied. So `--log-level error` cannot suppress them.
+
+However, `--log-level error` DOES suppress other warnings that occur AFTER cobra parsing, such as:
+- XDG_RUNTIME_DIR warnings
+- Any warnings during build step execution
+
+### Fix in v0.1.10
+
+| # | What changed | Why |
+|---|---|---|
+| 1 | Reverted `unshare --user --map-root-user` from all 3 wrappers | Restores v0.1.8 rootless mode (euid=1001). MaybeReexec fails harmlessly, buildah runs rootless. |
+| 2 | Added `--log-level error` to all 3 wrappers | Suppresses XDG_RUNTIME_DIR and other cobra-parsed warnings. Does NOT suppress MaybeReexec newuidmap warnings (those print before cobra). |
+| 3 | Added `chmod 755 /root && mkdir -p /root/.config/containers/containers.conf.d` | Safety net: if buildah ever runs as euid=0, this prevents the EACCES. |
+| 4 | Kept newuidmap/newgidmap stubs (exit 1) | Keeps warning messages minimal (empty stderr vs "Permission denied"). |
+| 5 | Kept `export _CONTAINERS_USERNS_CONFIGURED=1` in wrappers | Belt-and-suspenders: prevents env drift. |
+
+### containers/common v0.44 config discovery (source code confirmed)
+
+From `config_linux.go`:
+```go
+func customConfigFile() (string, error) {
+    if path, found := os.LookupEnv("CONTAINERS_CONF"); found {
+        return path, nil  // ONLY our path, skip everything else
+    }
+    if unshare.IsRootless() {
+        return rootlessConfigPath()  // $HOME/.config/containers/
+    }
+    return OverrideContainersConfig, nil  // /etc/containers/containers.conf
+}
+```
+
+v0.44 does NOT have `.conf.d` support. Ubuntu 22.04 has BACKPORTED this feature. The backport adds scanning of `$HOME_DIR/.config/containers/containers.conf.d/` which resolves to `/root/.config/containers/containers.conf.d/` when euid=0.
+
+### Wrapper scripts (v0.1.10)
+```sh
+# /usr/local/bin/buildah
+#!/bin/sh
+# ... symlink repair + export _CONTAINERS_USERNS_CONFIGURED=1 ...
+exec /usr/bin/buildah \
+  --log-level error \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+
+# /usr/local/bin/podman (and /usr/local/bin/docker → podman)
+#!/bin/sh
+# ... symlink repair + export _CONTAINERS_USERNS_CONFIGURED=1 ...
+exec /usr/bin/podman \
+  --log-level error \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+```
+
+### Login failure reminder
+`buildah login` "too many arguments, login takes only 1 argument" — cobra's `ExactArgs(1)`. Caused by unquoted `${{ secrets.REGISTRY_USERNAME }}` in workflow YAML → word splitting → extra positional args. Fix in workflow:
+```yaml
+buildah login --username "${{ secrets.REGISTRY_USERNAME }}" --password "${{ secrets.REGISTRY_PASSWORD }}" docker.io
+```
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.10-s390x` — v0.1.10, reverted unshare + --log-level error + /root/ safety. Digest: `sha256:49810a4a57c2768fb921085ce0888ff0e61439...`.
+
+### Files updated
+- `docker/runner-s390x-dind/wrappers/buildah-wrapper.sh` — reverted unshare, added --log-level error, updated comments
+- `docker/runner-s390x-dind/wrappers/podman-wrapper.sh` — same
+- `docker/runner-s390x-dind/wrappers/docker-wrapper.sh` — same
+- `docker/runner-s390x-dind/Dockerfile` — added /root/ chmod, updated wrapper comments, updated header
+- `.env.example` — `IMAGE_TAG=0.1.10-s390x`
+- `docs/test-dind-pod.yaml` — image tag bumped to v0.1.10
+- `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.10
 
 ## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)

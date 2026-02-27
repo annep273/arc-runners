@@ -1,35 +1,35 @@
 #!/bin/sh
 # ── buildah wrapper ──────────────────────────────────────────────────
 # Installed at /usr/local/bin/buildah (PATH priority over /usr/bin/buildah).
-# Runs buildah inside a user namespace to eliminate newuidmap warnings.
+# Runs buildah with explicit VFS + ignore_chown_errors flags.
 #
-# WHY UNSHARE:
-#   buildah's MaybeReexecUsingUserNamespace() in main() runs on EVERY
-#   command (login, images, inspect, bud — everything). When euid != 0,
-#   it ALWAYS tries to re-exec with newuidmap/newgidmap. The env var
-#   _CONTAINERS_USERNS_CONFIGURED only prevents the re-exec'd CHILD
-#   from looping — it does NOT prevent the initial attempt.
+# HOW IT WORKS:
+#   buildah's MaybeReexecUsingUserNamespace() runs at startup and tries
+#   to re-exec inside a user namespace (newuidmap/newgidmap). In
+#   enterprise k8s these always fail (SELinux/seccomp/CRI-O blocking
+#   /proc/*/gid_map writes), so the function falls through and buildah
+#   continues running as euid=1001 in plain rootless mode.
 #
-#   In enterprise k8s, newuidmap always fails (SELinux/seccomp/CRI-O
-#   blocking /proc/*/gid_map writes), producing noisy warnings:
-#     "error running newgidmap: exit status 1"
-#     "falling back to single mapping"
+#   The 2–3 lines of "error running newgidmap" warnings are cosmetic.
+#   Our newuidmap/newgidmap stubs (exit 1) keep the messages minimal.
 #
-#   Fix: unshare --user --map-root-user creates a user namespace where
-#   euid=0 (mapped to host UID 1001). MaybeReexecUsingUserNamespace()
-#   checks: euid==0 && IsRootless() → true → returns immediately.
-#   No re-exec, no newuidmap attempt, no warnings.
+#   NOTE: We do NOT use 'unshare --user --map-root-user' here because
+#   making euid=0 triggers ROOT config discovery paths in containers/
+#   common, which tries to lstat /root/.config/containers/containers.
+#   conf.d — inaccessible to host UID 1001 → fatal error.
+#   The rootless (euid=1001) code path uses $HOME/.config/ which works.
 #
 # MOUNT INJECTION:
-#   buildah reads /usr/share/containers/mounts.conf by default and
-#   injects these into every build container:
+#   buildah reads /usr/share/containers/mounts.conf and injects:
 #   - APT sandbox config (prevents setgroups errors)
 #   - chown/chgrp shell shims (intercept shell commands)
 #   - fakechown.so + ld.so.preload (intercept libc chown calls)
 #
 # NOTES on buildah 1.23.1:
-#   --storage-driver, --storage-opt → global (PersistentFlags)
+#   --storage-driver, --storage-opt, --log-level → global (PersistentFlags)
 #   --isolation is NOT global — use BUILDAH_ISOLATION=chroot env var
+#   --log-level is parsed AFTER MaybeReexec, so it cannot suppress the
+#   newuidmap warnings (those print before cobra parses flags).
 # ─────────────────────────────────────────────────────────────────────
 
 # Repair user containers.conf symlink (prevents network_backend warning)
@@ -40,7 +40,8 @@ fi
 
 export _CONTAINERS_USERNS_CONFIGURED=1
 
-exec unshare --user --map-root-user -- /usr/bin/buildah \
+exec /usr/bin/buildah \
+  --log-level error \
   --storage-driver=vfs \
   --storage-opt vfs.ignore_chown_errors=true \
   "$@"

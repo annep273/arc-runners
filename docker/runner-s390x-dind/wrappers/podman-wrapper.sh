@@ -1,12 +1,11 @@
 #!/bin/sh
 # ── podman wrapper ───────────────────────────────────────────────────
 # Installed at /usr/local/bin/podman (PATH priority over /usr/bin/podman).
-# Runs podman inside a user namespace to eliminate newuidmap warnings.
+# Runs podman with explicit VFS + ignore_chown_errors flags.
 #
-# See buildah-wrapper.sh for the detailed explanation of why unshare
-# is needed: MaybeReexecUsingUserNamespace() always tries newuidmap
-# when euid != 0, regardless of _CONTAINERS_USERNS_CONFIGURED.
-# unshare --user --map-root-user makes euid=0 → function returns early.
+# See buildah-wrapper.sh for detailed explanation of why we do NOT use
+# 'unshare --user --map-root-user' (root config paths → /root/.config/
+# permission denied). Rootless mode (euid=1001) works correctly.
 #
 # SYMLINK REPAIR:
 #   ARC or workflow steps may overwrite the user-level containers.conf
@@ -22,7 +21,8 @@ fi
 
 export _CONTAINERS_USERNS_CONFIGURED=1
 
-exec unshare --user --map-root-user -- /usr/bin/podman \
+exec /usr/bin/podman \
+  --log-level error \
   --storage-driver=vfs \
   --storage-opt vfs.ignore_chown_errors=true \
   "$@"

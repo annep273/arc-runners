@@ -1,10 +1,10 @@
 #!/bin/sh
 # ── docker wrapper ───────────────────────────────────────────────────
 # Installed at /usr/local/bin/docker (PATH priority).
-# Maps 'docker' commands to podman inside a user namespace.
+# Maps 'docker' commands to podman with explicit VFS flags.
 # Standard docker-based CI steps work without modification.
 #
-# See buildah-wrapper.sh for the unshare explanation.
+# See buildah-wrapper.sh for why we do NOT use unshare.
 # ─────────────────────────────────────────────────────────────────────
 
 # Repair user containers.conf symlink (prevents network_backend warning)
@@ -15,7 +15,8 @@ fi
 
 export _CONTAINERS_USERNS_CONFIGURED=1
 
-exec unshare --user --map-root-user -- /usr/bin/podman \
+exec /usr/bin/podman \
+  --log-level error \
   --storage-driver=vfs \
   --storage-opt vfs.ignore_chown_errors=true \
   "$@"
