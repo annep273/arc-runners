@@ -9,26 +9,30 @@
 #   - VFS storage driver (no kernel overlay/fuse deps; works everywhere)
 #   - chroot isolation (no runc/crun user-namespace requirement)
 #   - _CONTAINERS_USERNS_CONFIGURED=1 always set (single-UID namespace)
-#   - chown/chgrp shims injected into build containers via mounts.conf
-#     to silently handle EINVAL/EPERM from single-UID mapping
-#   - ignore_chown_errors=true handles VFS layer extraction
+#   - Triple-layer chown protection for single-UID namespace:
+#     Layer 1: chown/chgrp shell shims (intercept /usr/bin/chown commands)
+#     Layer 2: LD_PRELOAD fakechown.so (intercept ALL libc chown syscalls)
+#     Layer 3: ignore_chown_errors=true (storage driver layer operations)
+#   - All injected via mounts.conf into every build container
 #   - ALL system-level configs replaced (not just user-level) to prevent
 #     podman 3.4.4 from reading unknown TOML keys shipped by Ubuntu 22.04's
 #     containers-common package (e.g. network.network_backend)
+#   - newuidmap/newgidmap neutered (fail silently in enterprise k8s anyway)
 #   - All writable paths under /tmp or /home/runner (no /run access needed)
 #
-# KNOWN ISSUE: Ubuntu 22.04 ships podman 3.4.4 / buildah 1.23.1, which are
-# from late 2021. The containers-common package may ship config files with
-# TOML keys added in later versions (e.g. network_backend). These cause
-# "Failed to decode" warnings/errors. We fix this by replacing ALL config
-# files at the system level.
+# PERMISSION FAILURE COVERAGE:
+#   ✅ RUN chown/chgrp        → shell shims (mounts.conf bind mount)
+#   ✅ RUN useradd -m          → LD_PRELOAD fakechown.so
+#   ✅ RUN tar --same-owner    → LD_PRELOAD fakechown.so
+#   ✅ RUN install -o          → LD_PRELOAD fakechown.so
+#   ✅ RUN cp --preserve       → LD_PRELOAD fakechown.so
+#   ✅ RUN apt-get install     → APT sandbox + LD_PRELOAD for dpkg chown
+#   ✅ VFS layer extraction    → ignore_chown_errors=true
+#   ⚠️ COPY --chown=user      → Go raw syscall, NOT interceptable*
+#   ⚠️ Alpine/musl images     → shell shims work, LD_PRELOAD may not
+#   ℹ️ newuidmap warnings     → replaced with silent stubs
 #
-# For overlay storage with full user-namespace support, set in Helm values:
-#   hostUsers: false  (k8s 1.30+)
-#
-# NOTE: chown/chgrp to non-root UIDs in Dockerfiles is handled by shim
-# scripts that silently succeed when ownership changes fail. This covers
-# common patterns like: RUN useradd appuser && chown -R appuser:appgroup /app
+#   * Workaround: use COPY + RUN chown instead of COPY --chown
 #
 # Build command:
 #   docker buildx build --platform linux/s390x \
@@ -37,6 +41,20 @@
 
 ARG BASE_IMAGE=annepdevops/actions-runner:0.1.0-s390x
 
+# ── Stage 1: Compile fakechown.so for LD_PRELOAD injection ──────────
+# This shared library intercepts chown/lchown/fchown/fchownat libc calls
+# inside build containers. Tries real implementation first; suppresses
+# EINVAL (UID not mapped) and EPERM (no CAP_CHOWN) silently.
+# Covers: useradd -m, tar --same-owner, install -o, cp --preserve, dpkg
+# NOT: Go programs (buildah COPY --chown uses raw syscalls, not libc)
+FROM ubuntu:22.04 AS fakechown-builder
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY wrappers/fakechown.c /tmp/fakechown.c
+RUN gcc -shared -fPIC -o /tmp/fakechown.so /tmp/fakechown.c -ldl
+
+# ── Stage 2: Main runner image ──────────────────────────────────────
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="ARC Self-Hosted Runner DinD (s390x)" \
@@ -60,6 +78,18 @@ RUN apt-get update && \
       slirp4netns && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Neuter newuidmap/newgidmap ───────────────────────────────────────
+# These are pulled in by the uidmap package (dependency of podman).
+# In enterprise k8s, they ALWAYS fail due to SELinux/seccomp/CRI-O
+# blocking writes to /proc/*/gid_map, producing noisy warnings:
+#   "error running newgidmap: ... Permission denied"
+#   "falling back to single mapping"
+# Replace with silent stubs that exit 1 immediately. containers/storage
+# sees exit 1 and falls back to single-UID mapping (the correct behavior).
+RUN printf '#!/bin/sh\nexit 1\n' > /usr/bin/newuidmap && \
+    printf '#!/bin/sh\nexit 1\n' > /usr/bin/newgidmap && \
+    chmod 755 /usr/bin/newuidmap /usr/bin/newgidmap
 
 # ── CRITICAL: Replace ALL system-level config files ──────────────────
 # Ubuntu 22.04's containers-common package ships config files that may
@@ -197,6 +227,23 @@ COPY wrappers/chgrp-shim.sh /usr/local/share/containers/chgrp-shim.sh
 RUN chmod +x /usr/local/share/containers/chown-shim.sh \
              /usr/local/share/containers/chgrp-shim.sh
 
+# ── LD_PRELOAD library for comprehensive chown interception ──────────
+# The shell shims above only cover explicit chown/chgrp commands.
+# Many programs call chown() via libc directly (useradd, tar, install,
+# dpkg, cp --preserve). The LD_PRELOAD library intercepts ALL libc
+# chown/lchown/fchown/fchownat calls, tries real implementation first,
+# suppresses EINVAL/EPERM silently.
+#
+# Injected into build containers via mounts.conf:
+#   fakechown.so → /usr/local/lib/fakechown.so
+#   ld.so.preload → /etc/ld.so.preload (tells dynamic linker to load .so)
+#
+# NOTE: Does NOT intercept Go programs (buildah, podman) which use raw
+# syscalls. buildah COPY --chown uses Go's os.Lchown() → raw SYS_LCHOWN.
+# Workaround: use COPY + RUN chown instead of COPY --chown.
+COPY --from=fakechown-builder /tmp/fakechown.so /usr/local/share/containers/fakechown.so
+COPY wrappers/ld.so.preload /usr/local/share/containers/ld.so.preload
+
 # ── Default mounts for buildah builds ────────────────────────────
 # mounts.conf tells buildah to auto-inject files into every container
 # it builds (via setupMounts → subscriptions.MountsWithUIDGID).
@@ -204,16 +251,23 @@ RUN chmod +x /usr/local/share/containers/chown-shim.sh \
 #
 # Injected files:
 #   1. APT sandbox config — prevents setgroups errors in apt-get
-#   2. chown shim — silently handles EINVAL/EPERM from single-UID mapping
-#   3. chgrp shim — same for chgrp
+#   2. chown shim — intercepts /usr/bin/chown commands
+#   3. chgrp shim — intercepts /usr/bin/chgrp commands
+#   4. fakechown.so — LD_PRELOAD library intercepting libc chown syscalls
+#   5. ld.so.preload — tells dynamic linker to load fakechown.so
 #
-# The chown/chgrp shims mount at /usr/local/bin/ which is earlier in
-# PATH than /usr/bin/ on all standard Linux distributions.
+# Together, entries 2-5 provide triple-layer chown protection:
+#   Shell shims: RUN chown, RUN chgrp (all distros including Alpine)
+#   LD_PRELOAD:  useradd -m, tar, install, cp, dpkg (glibc distros)
+#   storage.conf: VFS layer extraction (buildah internal)
+#
 # Source: containers/common pkg/subscriptions/subscriptions.go
 RUN printf '%s\n' \
       '/etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox' \
       '/usr/local/share/containers/chown-shim.sh:/usr/local/bin/chown' \
       '/usr/local/share/containers/chgrp-shim.sh:/usr/local/bin/chgrp' \
+      '/usr/local/share/containers/fakechown.so:/usr/local/lib/fakechown.so' \
+      '/usr/local/share/containers/ld.so.preload:/etc/ld.so.preload' \
       > /usr/share/containers/mounts.conf
 
 # ── User-level configs (symlinked to system for safety) ──────────────
@@ -237,15 +291,14 @@ RUN mkdir -p /home/runner/.config/containers && \
 #     - cannot setup namespace using newuidmap
 #
 # _CONTAINERS_USERNS_CONFIGURED=1:
-#   ALWAYS set. Tells containers/storage to skip newuidmap/newgidmap.
-#   We previously tried auto-detecting sub-UID mapping capability,
-#   but even when NoNewPrivs=0 + suid bits pass, newuidmap can STILL
-#   fail (SELinux, seccomp, CRI-O restrictions on /proc/*/gid_map).
-#   When it fails, containers/storage falls back to single mapping
-#   anyway, producing confusing "Permission denied" warnings.
-#   Wrapper scripts explicitly export this to ensure it stays set.
-#   chown/chgrp to non-root UIDs is handled by shim scripts injected
-#   into build containers via mounts.conf (see chown-shim.sh).
+#   ALWAYS set. Tells containers/storage to skip MaybeReexecUsingUserNamespace().
+#   newuidmap/newgidmap are replaced with silent stubs (exit 1) since they
+#   always fail in enterprise k8s (SELinux/seccomp/CRI-O restrictions).
+#   Wrapper scripts also export this explicitly to prevent env drift.
+#   chown/chgrp to non-root UIDs is handled by:
+#     - Shell shims (mounts.conf → /usr/local/bin/chown, /usr/local/bin/chgrp)
+#     - LD_PRELOAD fakechown.so (mounts.conf → /usr/local/lib/fakechown.so)
+#     - ignore_chown_errors=true in storage.conf (VFS layer operations)
 #
 # STORAGE_DRIVER=vfs:
 #   Most compatible driver. No kernel module or fuse dependencies.

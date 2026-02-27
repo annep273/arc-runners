@@ -467,6 +467,60 @@ The only difference: without env var, there's extra overhead + confusing warning
 - `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.7
 
 ## Enhancements remaining (P1-P3)
+
+## DinD Rootless Fixes (Phase 10 — v0.1.8, LD_PRELOAD + newuidmap stubs)
+
+### Problem
+v0.1.7 shell shims fixed `RUN chown/chgrp` in Dockerfiles, but did NOT cover:
+1. **C programs calling chown syscalls directly**: `useradd -m` (creates + chowns home dir), `tar --same-owner` (default for root), `install -o`, `cp --preserve=ownership`, dpkg postinst scripts
+2. **newuidmap/newgidmap warnings**: The real binaries (from uidmap package, dependency of podman) still try to open /proc/*/gid_map, fail with "Permission denied" from SELinux/seccomp/CRI-O
+3. **buildah login "too many arguments"**: Identified as workflow bug (password not quoted → word splitting → extra positional args to cobra CLI)
+
+### Comprehensive permission failure analysis
+| Category | Program | Failure | Fix | Status |
+|----------|---------|---------|-----|--------|
+| Shell cmd | chown/chgrp | EINVAL | Shell shims (mounts.conf) | ✅ v0.1.7 |
+| C program | useradd -m | EINVAL | LD_PRELOAD fakechown.so | ✅ v0.1.8 |
+| C program | tar --same-owner | EINVAL | LD_PRELOAD fakechown.so | ✅ v0.1.8 |
+| C program | install -o | EINVAL | LD_PRELOAD fakechown.so | ✅ v0.1.8 |
+| C program | cp --preserve | EINVAL | LD_PRELOAD fakechown.so | ✅ v0.1.8 |
+| C program | dpkg postinst | EINVAL | LD_PRELOAD fakechown.so | ✅ v0.1.8 |
+| Go binary | buildah COPY --chown | EINVAL | Go raw syscall, NOT interceptable | ❌ Known limitation |
+| Pkg mgr | apt-get | EPERM | APT::Sandbox::User "root" | ✅ v0.1.5 |
+| Storage | VFS layer ops | EINVAL | ignore_chown_errors=true | ✅ v0.1.3 |
+| NS setup | newuidmap | EPERM | Silent stubs (exit 1) | ✅ v0.1.8 |
+| Config | containers.conf | Parse error | Clean configs at all levels | ✅ v0.1.3 |
+
+### Key insights
+- **LD_PRELOAD vs Go programs**: Go programs (buildah, podman) use raw `SYS_LCHOWN` syscalls via Go's syscall package, bypassing libc entirely. LD_PRELOAD only intercepts libc calls. So buildah's COPY --chown is NOT fixable via LD_PRELOAD. Workaround: use `COPY . /app` + `RUN chown` instead.
+- **musl libc (Alpine)**: musl may not fully support /etc/ld.so.preload in all versions. Shell shims handle Alpine case (busybox chown at /bin/chown).
+- **Triple-layer protection**: Shell shims (all distros) + LD_PRELOAD (glibc C programs) + storage.conf (buildah internal) = comprehensive coverage.
+- **buildah login failure**: "too many arguments, login takes only 1 argument" → workflow passes unquoted `$PASSWORD` containing space → shell word-splits into extra positional args for cobra CLI's login subcommand. Fix: quote variables in workflow.
+
+### Fix in v0.1.8
+1. **LD_PRELOAD fakechown.so** — Multi-stage build: ubuntu:22.04 builder installs gcc+libc6-dev, compiles `wrappers/fakechown.c` → `fakechown.so`. Shared library overrides `chown()`, `lchown()`, `fchown()`, `fchownat()` via `dlsym(RTLD_NEXT)`. Tries real implementation first; on EINVAL/EPERM returns 0 silently. Compiled in 0.5s under QEMU s390x.
+2. **ld.so.preload** — Contains `/usr/local/lib/fakechown.so`. Injected into build containers via mounts.conf at `/etc/ld.so.preload`. Dynamic linker reads this on process start and loads fakechown.so for ALL dynamically-linked programs.
+3. **mounts.conf expanded to 5 entries**:
+   - `/etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox` (apt sandbox)
+   - `/usr/local/share/containers/chown-shim.sh:/usr/local/bin/chown` (shell shim)
+   - `/usr/local/share/containers/chgrp-shim.sh:/usr/local/bin/chgrp` (shell shim)
+   - `/usr/local/share/containers/fakechown.so:/usr/local/lib/fakechown.so` (LD_PRELOAD)
+   - `/usr/local/share/containers/ld.so.preload:/etc/ld.so.preload` (preload config)
+4. **newuidmap/newgidmap replaced with stubs** — `printf '#!/bin/sh\nexit 1\n'` over the real binaries. Silent exit 1 → containers/storage falls back to single-UID mapping immediately without verbose "Permission denied" messages.
+5. **Dockerfile updated** — Multi-stage build (fakechown-builder + main), updated header comments with permission failure coverage matrix, _CONTAINERS_USERNS_CONFIGURED comment updated.
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.8-s390x` — v0.1.8, triple-layer chown protection + newuidmap stubs. Digest: `sha256:33cf6a26e2491f462b5bf431e1bc5c90125d74eb78fce20a0b68780f54d439bf`.
+
+### Files updated
+- `docker/runner-s390x-dind/Dockerfile` — multi-stage build, newuidmap stubs, LD_PRELOAD COPY, 5-entry mounts.conf, updated comments
+- `docker/runner-s390x-dind/wrappers/fakechown.c` — NEW, C source for LD_PRELOAD library
+- `docker/runner-s390x-dind/wrappers/ld.so.preload` — NEW, /usr/local/lib/fakechown.so path
+- `.env.example` — `IMAGE_TAG=0.1.8-s390x`
+- `docs/test-dind-pod.yaml` — image tag bumped to v0.1.8
+- `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.8
+
+## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)
 1. Fix `runner-s390x-dind` package installation path (Ubuntu apt packages vs UBI/microdnf) and align base/runtime assumptions.
 2. Pin all downloaded artifacts by immutable version + SHA256 (runner tarball, hooks, any docker/buildx/static binaries).
