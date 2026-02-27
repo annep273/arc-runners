@@ -368,22 +368,27 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.config && \
     chown -R 1001:0 /home/runner/.local
 
-# ── Wrapper scripts with explicit CLI flags ───────────────────────────
+# ── Wrapper scripts with unshare + explicit CLI flags ─────────────────
 # Installed at /usr/local/bin/ (PATH priority over /usr/bin/).
 # Source files: wrappers/*.sh (COPY'd into the image).
 #
 # Each wrapper:
 #   1. Repairs user containers.conf symlink (prevents network_backend warning)
-#   2. Explicitly exports _CONTAINERS_USERNS_CONFIGURED=1 to prevent
-#      newuidmap attempts (which fail in enterprise k8s environments
-#      due to SELinux/seccomp/CRI-O blocking /proc/*/gid_map writes)
-#   3. Adds explicit CLI flags (storage-driver, storage-opt) as
-#      belt-and-suspenders alongside env vars
+#   2. Exports _CONTAINERS_USERNS_CONFIGURED=1
+#   3. Runs the real binary inside a user namespace via:
+#        unshare --user --map-root-user -- /usr/bin/buildah ...
+#      This makes euid=0 inside the namespace. buildah's
+#      MaybeReexecUsingUserNamespace() then sees euid==0 && IsRootless()
+#      and returns immediately — no newuidmap/newgidmap attempt, no
+#      "error running newgidmap" / "falling back to single mapping" warnings.
+#   4. Adds explicit CLI flags (storage-driver, storage-opt)
 #
-# IMPORTANT for buildah 1.23.1:
-#   --storage-driver, --storage-opt ARE global (PersistentFlags)
-#   --default-mounts-file IS a global flag (PersistentFlag)
-#   --isolation is NOT global — use BUILDAH_ISOLATION=chroot env var
+# WHY THIS IS NEEDED:
+#   MaybeReexecUsingUserNamespace() checks: euid==0 && IsRootless().
+#   When euid != 0 (our runner UID 1001), it ALWAYS tries to re-exec
+#   with newuidmap, regardless of _CONTAINERS_USERNS_CONFIGURED.
+#   That env var only prevents the RE-EXEC'D CHILD from looping.
+#   Source: containers/storage v1.38.2 pkg/unshare/unshare_linux.go
 #
 # We do NOT force --root/--runroot — storage paths come from
 # CONTAINERS_STORAGE_CONF or the workflow's own storage.conf.

@@ -11,7 +11,7 @@
 # Usage:
 #   bash scripts/test-dind-rootless.sh [IMAGE]
 #
-# Default image: docker.io/annepdevops/actions-runner-dind:0.1.8-s390x
+# Default image: docker.io/annepdevops/actions-runner-dind:0.1.9-s390x
 # ---------------------------------------------------------------------------
 set -euo pipefail
 

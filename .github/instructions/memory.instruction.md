@@ -520,6 +520,69 @@ v0.1.7 shell shims fixed `RUN chown/chgrp` in Dockerfiles, but did NOT cover:
 - `docs/test-dind-pod.yaml` — image tag bumped to v0.1.8
 - `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.8
 
+## DinD Rootless Fixes (Phase 11 — v0.1.9, unshare user namespace wrappers)
+
+### Problem
+v0.1.8 stubs reduced newuidmap warning verbosity (empty error message instead of "Permission denied") but warnings STILL appear on every buildah/podman command: `error running newgidmap: exit status 1: ""`. Also, buildah login failed with "too many arguments, login takes only 1 argument".
+
+### Root cause analysis (DEFINITIVE — from containers/storage v1.38.2 source code)
+
+**MaybeReexecUsingUserNamespace() in `pkg/unshare/unshare_linux.go`:**
+```go
+func MaybeReexecUsingUserNamespace(evenForRoot bool) {
+    // Check if already in namespace
+    if os.Geteuid() == 0 && IsRootless() {
+        return  // ← ONLY returns when euid==0 AND IsRootless()
+    }
+    // ... proceeds to re-exec with user namespace
+    cmd.UseNewuidmap = uidNum != 0  // ← 1001 != 0 → true → tries newuidmap
+    cmd.UseNewgidmap = uidNum != 0  // ← true → tries newgidmap
+}
+```
+
+**Critical finding:** When euid=1001, `os.Geteuid() == 0` is FALSE → function NEVER returns early → ALWAYS proceeds to try newuidmap. The `_CONTAINERS_USERNS_CONFIGURED=1` env var only affects `IsRootless()` (which returns true), but the AND with `euid==0` still fails. This means _CONTAINERS_USERNS_CONFIGURED has NO effect on preventing the initial newuidmap attempt for non-root users.
+
+**buildah chroot isolation (`chroot/run.go`):**
+- `runUsingChroot()` does NOT set `UseNewuidmap`/`UseNewgidmap` (they default to false)
+- `CLONE_NEWUSER` is only added when `UIDMappings`/`GIDMappings` are present or user NS is requested
+- Confirmed: ALL newuidmap warnings come from `MaybeReexecUsingUserNamespace()` in main(), NOT from build steps
+
+**Login failure:** `buildah login` — cobra's `ExactArgs(1)` validator. Workflow passes unquoted `${{ secrets.REGISTRY_USERNAME }}` → word splitting if username contains spaces → extra positional arg. NOT fixable from runner image — workflow quoting issue.
+
+### Fix in v0.1.9 — unshare --user --map-root-user wrappers
+1. **All 3 wrapper scripts updated** to use `exec unshare --user --map-root-user -- /usr/bin/{buildah|podman} ...`
+2. **How it works:**
+   - `unshare --user --map-root-user` (util-linux 2.37.2, Ubuntu 22.04 essential pkg) creates user namespace with euid=0 mapped to host UID 1001
+   - Inside namespace: `MaybeReexecUsingUserNamespace()` → `euid==0 && IsRootless()` → true → returns immediately
+   - No re-exec, no newuidmap attempt, no warnings
+   - CLONE_NEWUSER allowed even with `allowPrivilegeEscalation: false` + seccomp RuntimeDefault (proven by buildah already successfully creating user NS in this environment)
+3. **Removed `--default-mounts-file`** from buildah wrapper — `/usr/share/containers/mounts.conf` is already the default path
+4. **Kept newuidmap/newgidmap stubs** as fallback safety net
+
+### Comprehensive permission failure coverage (v0.1.9 — cumulative)
+| Category | Fix | Introduced |
+|----------|-----|------------|
+| RUN chown/chgrp | Shell shims via mounts.conf | v0.1.7 |
+| C programs (useradd, tar, install, cp, dpkg) | LD_PRELOAD fakechown.so via mounts.conf | v0.1.8 |
+| VFS layer extraction | ignore_chown_errors=true in storage.conf | v0.1.3 |
+| apt-get sandbox | APT::Sandbox::User "root" via mounts.conf | v0.1.5 |
+| newuidmap warnings | unshare --user --map-root-user in wrappers | v0.1.9 |
+| containers.conf parse errors | Clean configs + CONTAINERS_CONF env var + symlink | v0.1.4 |
+| COPY --chown=user | NOT fixable (Go raw syscall bypasses libc) | Known limitation |
+| buildah login failure | Workflow quoting fix needed | NOT runner image issue |
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.9-s390x` — v0.1.9, unshare user namespace wrappers. Digest: `sha256:0d6921189ba1316260619b21506bcd5f3e89d4bef3ffd0d13abb0e1938220067`.
+
+### Files updated
+- `docker/runner-s390x-dind/wrappers/buildah-wrapper.sh` — added unshare, removed --default-mounts-file, detailed comments
+- `docker/runner-s390x-dind/wrappers/podman-wrapper.sh` — added unshare
+- `docker/runner-s390x-dind/wrappers/docker-wrapper.sh` — added unshare
+- `docker/runner-s390x-dind/Dockerfile` — updated wrapper comment section
+- `.env.example` — `IMAGE_TAG=0.1.9-s390x`
+- `docs/test-dind-pod.yaml` — image tag bumped to v0.1.9
+- `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.9
+
 ## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)
 1. Fix `runner-s390x-dind` package installation path (Ubuntu apt packages vs UBI/microdnf) and align base/runtime assumptions.
