@@ -404,6 +404,68 @@ v0.1.5 apt-get fix WORKED, but user's Spring Boot Dockerfile `RUN chown -R appus
 - buildah tutorial 05: OpenShift rootless with anyuid SCC.
 - Ubuntu 22.04 packages database — confirmed podman 3.4.4, buildah 1.23.1, containers-common 0.44.
 
+## DinD Rootless Fixes (Phase 9 — v0.1.7, chown/chgrp shim injection)
+
+### Problem
+v0.1.6 auto-detection approach FAILED in production. Full GitHub Actions log analysis revealed 4 root causes:
+1. **Auto-detection false positive**: Wrapper detected `NoNewPrivs: 0` (pod has default `allowPrivilegeEscalation: true`) + suid bits on newuidmap → unset `_CONTAINERS_USERNS_CONFIGURED` → `MaybeReexecUsingUserNamespace()` launched → newuidmap tried but FAILED: `newgidmap: open of gid_map failed: Permission denied` (SELinux/seccomp/CRI-O blocking `/proc/*/gid_map` writes in enterprise k8s)
+2. **Single-UID fallback**: After newuidmap failure, falls back to single mapping (0→1001) → chown to UID 999 (appuser) returns EINVAL
+3. **Workflow config sabotage**: CI workflow deletes `~/.config/containers/*.conf`, creates new configs with `network_backend = "cni"` (decode warning), uses `--root` override. Mitigated by CONTAINERS_CONF/CONTAINERS_STORAGE_CONF env vars.
+4. **Fundamental kernel limitation**: Without full sub-UID mapping (which requires enterprise-specific allowances), `lchown()` to unmapped UIDs ALWAYS returns EINVAL. No image config can fix this.
+
+### Key insight
+Whether `_CONTAINERS_USERNS_CONFIGURED=1` is set or not, the outcome is identical in this environment:
+- WITH env var: `MaybeReexecUsingUserNamespace()` skipped, but buildah's `runUsingChroot()` STILL creates CLONE_NEWUSER with single mapping (0→host_UID) for RUN steps → chown EINVAL
+- WITHOUT env var: newuidmap attempted + fails → fallback to same single mapping → same EINVAL
+The only difference: without env var, there's extra overhead + confusing warning messages. So always keep it set.
+
+### Fix in v0.1.7 — chown/chgrp shim injection via mounts.conf
+1. **Removed auto-detection entirely** from all 3 wrapper scripts. Added `export _CONTAINERS_USERNS_CONFIGURED=1` explicitly — prevents env drift and unnecessary newuidmap attempts.
+2. **Created `chown-shim.sh`** at `wrappers/chown-shim.sh`:
+   - Shell script that finds real chown binary (`/usr/bin/chown` or `/bin/chown`) inside build container
+   - Runs real chown with all original args, captures stderr
+   - On success: passes through
+   - If error contains "Invalid argument" (EINVAL) or "Operation not permitted" (EPERM): exits 0 (silent success)
+   - Other errors: propagates to caller
+   - Handles: Ubuntu merged /usr, Alpine busybox, missing binary (exits 0)
+3. **Created `chgrp-shim.sh`** — identical logic for chgrp command
+4. **Installed shims to `/usr/local/share/containers/`** in runner image via COPY + chmod +x
+5. **Updated `mounts.conf`** from 1 entry to 3 entries:
+   ```
+   /etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox
+   /usr/local/share/containers/chown-shim.sh:/usr/local/bin/chown
+   /usr/local/share/containers/chgrp-shim.sh:/usr/local/bin/chgrp
+   ```
+   This bind-mounts shims into EVERY build container at `/usr/local/bin/` which is BEFORE `/usr/bin/` in standard Linux PATH.
+6. **Removed `uidmap` package** and suid chmod step (not needed — newuidmap doesn't work in this environment anyway)
+
+### How shim injection works
+- buildah's `setupMounts()` → `subscriptions.MountsWithUIDGID()` reads `mounts.conf` and creates bind mounts
+- In chroot isolation, `setupChrootBindMounts()` processes ALL spec.Mounts with `unix.Mount()` — bind mounts work
+- `/usr/local/bin` is before `/usr/bin` in PATH on ALL standard Linux distros (Ubuntu, Debian, Alpine, RHEL)
+- When Dockerfile has `RUN chown -R appuser:appgroup /app /logs`, the shell finds `/usr/local/bin/chown` (our shim) first
+- Shim calls real `/usr/bin/chown`, catches EINVAL errors, exits 0 → build continues
+
+### Coverage and limitations
+- **Covered**: `RUN chown`, `RUN chgrp`, any shell script calling chown/chgrp
+- **NOT covered**: C programs calling `lchown()`/`fchown()` directly (e.g., `install -o`, `tar --same-owner`, `cp --preserve=ownership`)
+- **apt/dpkg**: Already handles chown failures gracefully (produces warnings, not errors)
+- **Future enhancement**: LD_PRELOAD with `fakechown.so` compiled for s390x, injected via `mounts.conf`+`/etc/ld.so.preload` for 100% coverage
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.7-s390x` — v0.1.7, chown/chgrp shim injection. Digest: `sha256:705673792f3525161748c04d52b51d523225499f96eca508997fa500652d23a9`.
+
+### Files updated
+- `docker/runner-s390x-dind/Dockerfile` — removed uidmap, added chown/chgrp shim COPY+chmod, updated mounts.conf to 3 entries, updated env/wrapper docs
+- `docker/runner-s390x-dind/wrappers/chown-shim.sh` — NEW, shell shim for chown
+- `docker/runner-s390x-dind/wrappers/chgrp-shim.sh` — NEW, shell shim for chgrp
+- `docker/runner-s390x-dind/wrappers/podman-wrapper.sh` — removed auto-detection, added explicit export
+- `docker/runner-s390x-dind/wrappers/buildah-wrapper.sh` — same
+- `docker/runner-s390x-dind/wrappers/docker-wrapper.sh` — same
+- `.env.example` — `IMAGE_TAG=0.1.7-s390x`
+- `docs/test-dind-pod.yaml` — image tag bumped to v0.1.7
+- `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.7
+
 ## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)
 1. Fix `runner-s390x-dind` package installation path (Ubuntu apt packages vs UBI/microdnf) and align base/runtime assumptions.

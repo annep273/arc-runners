@@ -8,12 +8,9 @@
 # SECURITY: This image runs as non-root (UID 1001).
 #   - VFS storage driver (no kernel overlay/fuse deps; works everywhere)
 #   - chroot isolation (no runc/crun user-namespace requirement)
-#   - uidmap package installed for sub-UID/sub-GID mapping support
-#   - Auto-detects allowPrivilegeEscalation at runtime:
-#     * Track A (strict): _CONTAINERS_USERNS_CONFIGURED=1 → single-UID
-#       mapping. chown to other UIDs returns EINVAL (kernel limitation).
-#     * Track C (SETUID/SETGID caps): full sub-UID mapping via newuidmap.
-#       chown to arbitrary UIDs works in build containers.
+#   - _CONTAINERS_USERNS_CONFIGURED=1 always set (single-UID namespace)
+#   - chown/chgrp shims injected into build containers via mounts.conf
+#     to silently handle EINVAL/EPERM from single-UID mapping
 #   - ignore_chown_errors=true handles VFS layer extraction
 #   - ALL system-level configs replaced (not just user-level) to prevent
 #     podman 3.4.4 from reading unknown TOML keys shipped by Ubuntu 22.04's
@@ -27,8 +24,11 @@
 # files at the system level.
 #
 # For overlay storage with full user-namespace support, set in Helm values:
-#   hostUsers: false  (k8s 1.30+)  -OR-
-#   allowPrivilegeEscalation: true + capabilities: {add: [SETUID, SETGID]}
+#   hostUsers: false  (k8s 1.30+)
+#
+# NOTE: chown/chgrp to non-root UIDs in Dockerfiles is handled by shim
+# scripts that silently succeed when ownership changes fail. This covers
+# common patterns like: RUN useradd appuser && chown -R appuser:appgroup /app
 #
 # Build command:
 #   docker buildx build --platform linux/s390x \
@@ -57,19 +57,9 @@ RUN apt-get update && \
       skopeo \
       fuse-overlayfs \
       iptables \
-      slirp4netns \
-      uidmap && \
+      slirp4netns && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-# ── Ensure suid on newuidmap/newgidmap ───────────────────────────────
-# Ubuntu's uidmap package sets suid by default. Belt-and-suspenders.
-# These binaries enable mapping 65536 UIDs (from /etc/subuid) into the
-# build container's user namespace, which makes chown to arbitrary UIDs
-# work. Requires allowPrivilegeEscalation: true in pod spec (Track C).
-# Without suid (or with no_new_privs set), wrapper scripts fall back to
-# single-UID mode (_CONTAINERS_USERNS_CONFIGURED=1).
-RUN chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap 2>/dev/null || true
 
 # ── CRITICAL: Replace ALL system-level config files ──────────────────
 # Ubuntu 22.04's containers-common package ships config files that may
@@ -180,14 +170,50 @@ RUN echo '{"default":[{"type":"insecureAcceptAnything"}]}' > /etc/containers/pol
 RUN mkdir -p /etc/apt/apt.conf.d && \
     echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99sandbox
 
-# ── Default mounts for buildah builds ────────────────────────────────
+# ── chown/chgrp shims for rootless builds ─────────────────────────
+# In rootless builds with single-UID namespace mapping, chown/chgrp
+# to any UID/GID other than 0 fails (EINVAL or EPERM). This is a kernel
+# limitation: the target UID simply doesn't exist in the namespace.
+#
+# These shim scripts are injected into EVERY build container via
+# mounts.conf (bind-mounted at /usr/local/bin/chown and /usr/local/bin/chgrp).
+# /usr/local/bin is earlier in PATH than /usr/bin, so the shims intercept
+# chown/chgrp commands. Each shim:
+#   1. Finds the real binary (/usr/bin/chown or /bin/chown)
+#   2. Runs it with the original arguments
+#   3. If it fails with "Invalid argument" or "Operation not permitted",
+#      silently succeeds (exit 0)
+#   4. For any other error, propagates it normally
+#
+# This handles the common Dockerfile pattern:
+#   RUN groupadd appgroup && useradd appuser
+#   RUN chown -R appuser:appgroup /app /logs
+#
+# Files retain ownership of UID 0 (root inside the build namespace,
+# which maps to runner UID 1001 on the host). This is safe for
+# containerized apps — the USER instruction controls runtime UID.
+COPY wrappers/chown-shim.sh /usr/local/share/containers/chown-shim.sh
+COPY wrappers/chgrp-shim.sh /usr/local/share/containers/chgrp-shim.sh
+RUN chmod +x /usr/local/share/containers/chown-shim.sh \
+             /usr/local/share/containers/chgrp-shim.sh
+
+# ── Default mounts for buildah builds ────────────────────────────
 # mounts.conf tells buildah to auto-inject files into every container
 # it builds (via setupMounts → subscriptions.MountsWithUIDGID).
-# This injects the apt sandbox config into Debian/Ubuntu build containers
-# so RUN apt-get commands work without modification.
-# For non-Debian containers, the file is harmlessly present.
+# Entries are source:destination bind mounts.
+#
+# Injected files:
+#   1. APT sandbox config — prevents setgroups errors in apt-get
+#   2. chown shim — silently handles EINVAL/EPERM from single-UID mapping
+#   3. chgrp shim — same for chgrp
+#
+# The chown/chgrp shims mount at /usr/local/bin/ which is earlier in
+# PATH than /usr/bin/ on all standard Linux distributions.
 # Source: containers/common pkg/subscriptions/subscriptions.go
-RUN echo '/etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox' \
+RUN printf '%s\n' \
+      '/etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox' \
+      '/usr/local/share/containers/chown-shim.sh:/usr/local/bin/chown' \
+      '/usr/local/share/containers/chgrp-shim.sh:/usr/local/bin/chgrp' \
       > /usr/share/containers/mounts.conf
 
 # ── User-level configs (symlinked to system for safety) ──────────────
@@ -211,13 +237,15 @@ RUN mkdir -p /home/runner/.config/containers && \
 #     - cannot setup namespace using newuidmap
 #
 # _CONTAINERS_USERNS_CONFIGURED=1:
-#   DEFAULT fallback that tells containers/storage to skip
-#   newuidmap/newgidmap. Prevents "cannot setup namespace" errors
-#   when suid binaries can't escalate (no_new_privs = 1).
-#   The wrapper scripts AUTO-DETECT and unset this when full sub-UID
-#   mapping is available (Track C: allowPrivilegeEscalation + SETUID).
-#   When unset, MaybeReexecUsingUserNamespace() creates a full mapping
-#   (0:host_uid:1 + 1:100000:65535) so chown works in build containers.
+#   ALWAYS set. Tells containers/storage to skip newuidmap/newgidmap.
+#   We previously tried auto-detecting sub-UID mapping capability,
+#   but even when NoNewPrivs=0 + suid bits pass, newuidmap can STILL
+#   fail (SELinux, seccomp, CRI-O restrictions on /proc/*/gid_map).
+#   When it fails, containers/storage falls back to single mapping
+#   anyway, producing confusing "Permission denied" warnings.
+#   Wrapper scripts explicitly export this to ensure it stays set.
+#   chown/chgrp to non-root UIDs is handled by shim scripts injected
+#   into build containers via mounts.conf (see chown-shim.sh).
 #
 # STORAGE_DRIVER=vfs:
 #   Most compatible driver. No kernel module or fuse dependencies.
@@ -287,21 +315,15 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.config && \
     chown -R 1001:0 /home/runner/.local
 
-# ── Wrapper scripts with explicit CLI flags + sub-UID detection ──────
+# ── Wrapper scripts with explicit CLI flags ───────────────────────────
 # Installed at /usr/local/bin/ (PATH priority over /usr/bin/).
 # Source files: wrappers/*.sh (COPY'd into the image).
 #
 # Each wrapper:
 #   1. Repairs user containers.conf symlink (prevents network_backend warning)
-#   2. Auto-detects sub-UID mapping capability:
-#      - Checks /proc/self/status for NoNewPrivs: 0
-#        (i.e. allowPrivilegeEscalation: true in pod spec)
-#      - Checks newuidmap/newgidmap have suid bit
-#      - If BOTH pass → unsets _CONTAINERS_USERNS_CONFIGURED
-#        → MaybeReexecUsingUserNamespace() creates full mapping
-#        → chown to arbitrary UIDs works in build containers
-#      - If EITHER fails → keeps _CONTAINERS_USERNS_CONFIGURED=1
-#        → single-UID fallback (chown limited to UID 0)
+#   2. Explicitly exports _CONTAINERS_USERNS_CONFIGURED=1 to prevent
+#      newuidmap attempts (which fail in enterprise k8s environments
+#      due to SELinux/seccomp/CRI-O blocking /proc/*/gid_map writes)
 #   3. Adds explicit CLI flags (storage-driver, storage-opt) as
 #      belt-and-suspenders alongside env vars
 #

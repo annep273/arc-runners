@@ -4,8 +4,8 @@
 # Maps 'docker' commands to podman with correct storage flags.
 # Standard docker-based CI steps work without modification.
 #
-# See podman-wrapper.sh for detailed documentation on symlink repair
-# and sub-UID detection logic.
+# See podman-wrapper.sh for documentation on symlink repair and why
+# _CONTAINERS_USERNS_CONFIGURED is always kept set.
 # ─────────────────────────────────────────────────────────────────────
 
 # Repair user containers.conf symlink (prevents network_backend warning)
@@ -14,11 +14,8 @@ if [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then
   ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null
 fi
 
-# Auto-detect sub-UID mapping (see podman-wrapper.sh for details)
-if grep -q 'NoNewPrivs:.*0' /proc/self/status 2>/dev/null && \
-   [ -u /usr/bin/newuidmap ] && [ -u /usr/bin/newgidmap ]; then
-  unset _CONTAINERS_USERNS_CONFIGURED
-fi
+# Ensure _CONTAINERS_USERNS_CONFIGURED stays set (prevents newuidmap attempts)
+export _CONTAINERS_USERNS_CONFIGURED=1
 
 exec /usr/bin/podman \
   --storage-driver=vfs \
