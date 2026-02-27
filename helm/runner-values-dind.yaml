@@ -6,8 +6,16 @@
 ## Image repository/tag are set via --set in the install script.
 ##
 ## IMPORTANT: The DIND image is configured for VFS + chroot isolation by
-## default, which works without any extra privileges. For faster overlay-based
-## builds, see "Track B" comments below.
+## default (Track A), which works without any extra privileges.
+##
+## If your Dockerfiles use chown/useradd/groupadd (common in production images),
+## you MUST use Track C (SETUID/SETGID caps) or Track B (hostUsers: false).
+## Without these, chown to UIDs other than root returns EINVAL because only
+## a single UID is mapped in the user namespace.
+##
+## The v0.1.6+ image auto-detects sub-UID capability at runtime:
+##   Track A: _CONTAINERS_USERNS_CONFIGURED=1 → single-UID (chown limited)
+##   Track C: unsets _CONTAINERS_USERNS_CONFIGURED → full mapping (chown works)
 
 ## githubConfigUrl and githubConfigSecret are set via --set in the install script
 githubConfigUrl: ""
@@ -36,7 +44,8 @@ template:
   spec:
     ## ── Track A: Strict non-root (default, works on restricted SCC) ──
     ## No extra capabilities needed. VFS + chroot isolation.
-    ## Trade-off: All file UIDs inside built images get squashed to UID 1001.
+    ## Trade-off: Only UID 0 mapped in user namespace — chown to other UIDs
+    ## returns EINVAL. OK for Dockerfiles without chown/useradd/groupadd.
     securityContext:
       runAsNonRoot: true
       runAsUser: 1001
@@ -81,22 +90,25 @@ template:
         #     drop:
         #       - ALL
 
-        ## ── Track C security context (uncomment for OpenShift anyuid SCC) ──
-        ## If your cluster doesn't support hostUsers: false, you can add
-        ## SETUID + SETGID caps instead. Requires a custom SCC that allows
-        ## allowPrivilegeEscalation: true (see docs/RUNBOOK.md).
+        ## ── Track C security context (RECOMMENDED for Dockerfiles with chown) ──
+        ## Enables suid newuidmap/newgidmap to create full sub-UID mapping
+        ## (65536 UIDs from /etc/subuid). This makes chown/useradd/groupadd
+        ## work correctly inside build containers.
+        ## Requires: allowPrivilegeEscalation: true + SETUID/SETGID caps.
+        ## On OpenShift, requires a custom SCC (see docs/RUNBOOK.md).
+        ## The wrapper scripts auto-detect this and enable full mapping.
         # securityContext:
         #   runAsNonRoot: true
         #   runAsUser: 1001
         #   runAsGroup: 1001
-        #   allowPrivilegeEscalation: true  # needed for newuidmap setuid
+        #   allowPrivilegeEscalation: true  # needed for newuidmap suid
         #   readOnlyRootFilesystem: false
         #   capabilities:
         #     drop:
         #       - ALL
         #     add:
-        #       - SETUID
-        #       - SETGID
+        #       - SETUID    # newuidmap needs this
+        #       - SETGID    # newgidmap needs this
 
         env:
           ## VFS + chroot defaults (set in image, repeated here for visibility)

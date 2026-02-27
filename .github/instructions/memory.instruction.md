@@ -369,6 +369,30 @@ exec /usr/bin/buildah \
 - **Ubuntu Manpage ch-image** — confirmed `APT::Sandbox::User "root"` approach
 - **DuckDuckGo search results** — confirmed `APT::Sandbox::User` disables privilege dropping, `/etc/apt/apt.conf.d/99sandbox` is the standard location
 
+## DinD Rootless Fixes (Phase 8 — v0.1.6, chown sub-UID mapping)
+
+### Problem
+v0.1.5 apt-get fix WORKED, but user's Spring Boot Dockerfile `RUN chown -R appuser:appgroup /app /logs` fails with "Invalid argument" (EINVAL) on every file. Root cause: single-UID user namespace mapping. With `_CONTAINERS_USERNS_CONFIGURED=1`, `MaybeReexecUsingUserNamespace()` returns early → only UID 0 maps to host UID 1001 → `lchown()` to UID 999 (appuser) returns EINVAL because that UID doesn't exist in the mapping.
+
+### Fix in v0.1.6
+1. **Installed `uidmap` package** — provides `newuidmap`/`newgidmap` with suid bit for mapping 65536 UIDs from `/etc/subuid`
+2. **Belt-and-suspenders suid** — `chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap`
+3. **Auto-detection in wrapper scripts** — checks `/proc/self/status` for `NoNewPrivs:.*0` AND suid bit on newuidmap/newgidmap:
+   - If BOTH pass (Track C: `allowPrivilegeEscalation: true` + SETUID/SETGID caps) → `unset _CONTAINERS_USERNS_CONFIGURED` → `MaybeReexecUsingUserNamespace()` creates full mapping (0:1001:1 + 1:100000:65535) → chown to arbitrary UIDs works
+   - If EITHER fails (Track A: strict non-root) → keeps `_CONTAINERS_USERNS_CONFIGURED=1` → single-UID fallback
+4. **Wrapper scripts refactored** — moved from inline `printf` to separate files `wrappers/*.sh`, COPY'd into image. Cleaner, easier to maintain.
+5. **Track C Helm values documented** — `helm/runner-values-dind.yaml` Track C section updated with clear explanation of chown requirement
+
+### Key technical details
+- `NoNewPrivs: 0` in `/proc/self/status` means `allowPrivilegeEscalation: true` → suid binaries can escalate → newuidmap works
+- `NoNewPrivs: 1` means `no_new_privs` kernel flag set → suid blocked → single-UID fallback
+- Wrapper detection: `grep -q 'NoNewPrivs:.*0' /proc/self/status && [ -u /usr/bin/newuidmap ] && [ -u /usr/bin/newgidmap ]`
+- When `_CONTAINERS_USERNS_CONFIGURED` is unset, containers/storage `MaybeReexecUsingUserNamespace()` re-execs buildah/podman in user namespace with full UID map from `/etc/subuid` (`runner:100000:65536`)
+- Inside that namespace, buildah chroot isolation inherits the parent's UID mapping (no CLONE_NEWUSER needed) → all UIDs 0-65535 are valid → `lchown(file, 999, 999)` succeeds
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.6-s390x` — v0.1.6, uidmap + sub-UID auto-detection. Digest: `sha256:577ed5e8f4bf47cdcca2f1ac4e9cb96b006232fa3637b80a9107252d51e662c3`.
+
 ### Files updated
 - `docker/runner-s390x-dind/Dockerfile` — storage.conf global `[storage.options]` + direct wrapper scripts
 - `.env.example` — `IMAGE_TAG=0.1.3-s390x`

@@ -8,8 +8,13 @@
 # SECURITY: This image runs as non-root (UID 1001).
 #   - VFS storage driver (no kernel overlay/fuse deps; works everywhere)
 #   - chroot isolation (no runc/crun user-namespace requirement)
-#   - _CONTAINERS_USERNS_CONFIGURED=1 bypasses newuidmap/newgidmap
-#   - ignore_chown_errors=true handles single-UID mapping
+#   - uidmap package installed for sub-UID/sub-GID mapping support
+#   - Auto-detects allowPrivilegeEscalation at runtime:
+#     * Track A (strict): _CONTAINERS_USERNS_CONFIGURED=1 → single-UID
+#       mapping. chown to other UIDs returns EINVAL (kernel limitation).
+#     * Track C (SETUID/SETGID caps): full sub-UID mapping via newuidmap.
+#       chown to arbitrary UIDs works in build containers.
+#   - ignore_chown_errors=true handles VFS layer extraction
 #   - ALL system-level configs replaced (not just user-level) to prevent
 #     podman 3.4.4 from reading unknown TOML keys shipped by Ubuntu 22.04's
 #     containers-common package (e.g. network.network_backend)
@@ -52,9 +57,19 @@ RUN apt-get update && \
       skopeo \
       fuse-overlayfs \
       iptables \
-      slirp4netns && \
+      slirp4netns \
+      uidmap && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Ensure suid on newuidmap/newgidmap ───────────────────────────────
+# Ubuntu's uidmap package sets suid by default. Belt-and-suspenders.
+# These binaries enable mapping 65536 UIDs (from /etc/subuid) into the
+# build container's user namespace, which makes chown to arbitrary UIDs
+# work. Requires allowPrivilegeEscalation: true in pod spec (Track C).
+# Without suid (or with no_new_privs set), wrapper scripts fall back to
+# single-UID mode (_CONTAINERS_USERNS_CONFIGURED=1).
+RUN chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap 2>/dev/null || true
 
 # ── CRITICAL: Replace ALL system-level config files ──────────────────
 # Ubuntu 22.04's containers-common package ships config files that may
@@ -196,9 +211,13 @@ RUN mkdir -p /home/runner/.config/containers && \
 #     - cannot setup namespace using newuidmap
 #
 # _CONTAINERS_USERNS_CONFIGURED=1:
-#   Tells containers/storage to skip newuidmap/newgidmap entirely.
-#   Prevents "cannot setup namespace using newuidmap" errors.
-#   Works with podman 3.4.4's containers/storage library.
+#   DEFAULT fallback that tells containers/storage to skip
+#   newuidmap/newgidmap. Prevents "cannot setup namespace" errors
+#   when suid binaries can't escalate (no_new_privs = 1).
+#   The wrapper scripts AUTO-DETECT and unset this when full sub-UID
+#   mapping is available (Track C: allowPrivilegeEscalation + SETUID).
+#   When unset, MaybeReexecUsingUserNamespace() creates a full mapping
+#   (0:host_uid:1 + 1:100000:65535) so chown works in build containers.
 #
 # STORAGE_DRIVER=vfs:
 #   Most compatible driver. No kernel module or fuse dependencies.
@@ -268,34 +287,35 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.config && \
     chown -R 1001:0 /home/runner/.local
 
-# ── Wrapper scripts with explicit CLI flags ──────────────────────────
-# Belt-and-suspenders: env vars (STORAGE_DRIVER, STORAGE_OPTS,
-# BUILDAH_ISOLATION) already configure everything. These wrappers add
-# explicit CLI flags as a safety net in case env vars are cleared.
+# ── Wrapper scripts with explicit CLI flags + sub-UID detection ──────
+# Installed at /usr/local/bin/ (PATH priority over /usr/bin/).
+# Source files: wrappers/*.sh (COPY'd into the image).
+#
+# Each wrapper:
+#   1. Repairs user containers.conf symlink (prevents network_backend warning)
+#   2. Auto-detects sub-UID mapping capability:
+#      - Checks /proc/self/status for NoNewPrivs: 0
+#        (i.e. allowPrivilegeEscalation: true in pod spec)
+#      - Checks newuidmap/newgidmap have suid bit
+#      - If BOTH pass → unsets _CONTAINERS_USERNS_CONFIGURED
+#        → MaybeReexecUsingUserNamespace() creates full mapping
+#        → chown to arbitrary UIDs works in build containers
+#      - If EITHER fails → keeps _CONTAINERS_USERNS_CONFIGURED=1
+#        → single-UID fallback (chown limited to UID 0)
+#   3. Adds explicit CLI flags (storage-driver, storage-opt) as
+#      belt-and-suspenders alongside env vars
 #
 # IMPORTANT for buildah 1.23.1:
 #   --storage-driver, --storage-opt ARE global (PersistentFlags)
 #   --default-mounts-file IS a global flag (PersistentFlag)
-#   --isolation is NOT a global flag — it's only valid on subcommands
-#   (bud, from, run). Use BUILDAH_ISOLATION=chroot env var instead.
+#   --isolation is NOT global — use BUILDAH_ISOLATION=chroot env var
 #
-# The VFS driver requires 'vfs.' prefix on options:
-#   Valid:   vfs.ignore_chown_errors=true
-#   Invalid: ignore_chown_errors=true  (causes "does not support" error)
-#
-# Each wrapper also repairs the user-level containers.conf symlink
-# before every invocation. This prevents "Failed to decode the keys
-# [network.network_backend]" warnings caused by ARC or workflow steps
-# creating a user containers.conf with keys unknown to podman 3.4.4.
-#
-# We do NOT force --root/--runroot here — storage paths come from
+# We do NOT force --root/--runroot — storage paths come from
 # CONTAINERS_STORAGE_CONF or the workflow's own storage.conf.
-# This avoids conflicts with workflows that configure their own paths.
-RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
-
-RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\n# NOTE: --isolation is NOT a global buildah flag.\n# Use BUILDAH_ISOLATION=chroot env var (already set in image).\n# --default-mounts-file injects apt sandbox config into build containers.\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  --default-mounts-file=/usr/share/containers/mounts.conf \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
-
-RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
+COPY wrappers/podman-wrapper.sh /usr/local/bin/podman
+COPY wrappers/buildah-wrapper.sh /usr/local/bin/buildah
+COPY wrappers/docker-wrapper.sh /usr/local/bin/docker
+RUN chmod +x /usr/local/bin/podman /usr/local/bin/buildah /usr/local/bin/docker
 
 # ── Validate configs at build time ───────────────────────────────────
 # Quick sanity check: ensure podman can read the config without errors.
