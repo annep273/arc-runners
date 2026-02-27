@@ -1,0 +1,182 @@
+## Runner scale set values for DinD mode (container builds inside runner pods)
+## Use this file instead of runner-values.yaml when workflows need to build
+## container images (docker build / buildah bud / podman build).
+##
+## This config uses the DIND runner image with podman/buildah/skopeo.
+## Image repository/tag are set via --set in the install script.
+##
+## IMPORTANT: The DIND image is configured for VFS + chroot isolation by
+## default, which works without any extra privileges. For faster overlay-based
+## builds, see "Track B" comments below.
+
+## githubConfigUrl and githubConfigSecret are set via --set in the install script
+githubConfigUrl: ""
+githubConfigSecret: arc-ghes-github-app
+
+minRunners: 0
+maxRunners: 10
+
+runnerGroup: "Default"
+
+## DinD mode uses "kubernetes" container mode — podman/buildah run inside
+## the runner container itself, not as a sidecar Docker daemon.
+## This is NOT the ARC "dind" containerMode (which requires a privileged
+## docker:dind sidecar). Our DIND runner uses podman-in-container.
+containerMode:
+  type: "kubernetes"
+  kubernetesModeWorkVolumeClaim:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: ""
+    resources:
+      requests:
+        storage: 10Gi
+
+## ─── Runner pod template ────────────────────────────────────────────
+template:
+  spec:
+    ## ── Track A: Strict non-root (default, works on restricted SCC) ──
+    ## No extra capabilities needed. VFS + chroot isolation.
+    ## Trade-off: All file UIDs inside built images get squashed to UID 1001.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001
+      seccompProfile:
+        type: RuntimeDefault
+
+    ## ── Track B: User namespaces (k8s 1.30+ / containerd 2.x) ──────
+    ## Uncomment to enable kernel user namespaces. This allows overlay storage
+    ## and proper UID mapping (faster builds, correct file ownership).
+    ## Requires: Kubernetes 1.30+ with UserNamespacesSupport feature gate.
+    # hostUsers: false
+
+    containers:
+      - name: runner
+        image: "ghcr.io/actions/actions-runner:latest"  # overridden by --set
+        command: ["/home/runner/run.sh"]
+        imagePullPolicy: IfNotPresent
+
+        ## ── Track A security context (default) ──
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+              - ALL
+
+        ## ── Track B security context (uncomment if using hostUsers: false) ──
+        ## With user namespaces, podman can use overlay storage and full
+        ## UID/GID mapping. Uncomment this INSTEAD of Track A above.
+        # securityContext:
+        #   runAsNonRoot: true
+        #   runAsUser: 1001
+        #   runAsGroup: 1001
+        #   allowPrivilegeEscalation: false
+        #   readOnlyRootFilesystem: false
+        #   capabilities:
+        #     drop:
+        #       - ALL
+
+        ## ── Track C security context (uncomment for OpenShift anyuid SCC) ──
+        ## If your cluster doesn't support hostUsers: false, you can add
+        ## SETUID + SETGID caps instead. Requires a custom SCC that allows
+        ## allowPrivilegeEscalation: true (see docs/RUNBOOK.md).
+        # securityContext:
+        #   runAsNonRoot: true
+        #   runAsUser: 1001
+        #   runAsGroup: 1001
+        #   allowPrivilegeEscalation: true  # needed for newuidmap setuid
+        #   readOnlyRootFilesystem: false
+        #   capabilities:
+        #     drop:
+        #       - ALL
+        #     add:
+        #       - SETUID
+        #       - SETGID
+
+        env:
+          ## VFS + chroot defaults (set in image, repeated here for visibility)
+          - name: BUILDAH_ISOLATION
+            value: "chroot"
+          - name: STORAGE_DRIVER
+            value: "vfs"
+          - name: _CONTAINERS_USERNS_CONFIGURED
+            value: "1"
+          - name: XDG_RUNTIME_DIR
+            value: "/tmp/xdg-run-1001"
+
+          ## ── Track B env overrides (uncomment if using hostUsers: false) ──
+          ## Override storage to overlay for better performance.
+          # - name: STORAGE_DRIVER
+          #   value: "overlay"
+          # - name: _CONTAINERS_USERNS_CONFIGURED
+          #   value: ""
+
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+
+        volumeMounts:
+          ## podman/buildah storage (image layers, build cache)
+          - name: containers-storage
+            mountPath: /home/runner/.local/share/containers
+          ## Writable runtime dirs under /tmp
+          - name: tmp-runtime
+            mountPath: /tmp/containers-run-1001
+          - name: xdg-runtime
+            mountPath: /tmp/xdg-run-1001
+
+    volumes:
+      ## emptyDir for container image layers — size-limited to prevent
+      ## runaway builds from filling the node
+      - name: containers-storage
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: tmp-runtime
+        emptyDir:
+          medium: ""
+      - name: xdg-runtime
+        emptyDir:
+          medium: ""
+
+## ─── Listener pod template ──────────────────────────────────────────
+listenerTemplate:
+  spec:
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: listener
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+## Optional: controller service account reference
+# controllerServiceAccount:
+#   namespace: arc-systems
+#   name: arc-gha-rs-controller

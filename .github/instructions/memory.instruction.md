@@ -54,6 +54,46 @@ applyTo: '**'
 - [x] Added listener pod securityContext in runner-values.yaml
 - [x] Added RUNNER_CONTAINER_HOOKS_VERSION to build script and .env.example
 
+## DinD Rootless Fixes (Phase 3 — runtime errors resolved)
+
+### Errors fixed
+1. **`XDG_RUNTIME_DIR is pointing to a path which is not writable`** → Set `XDG_RUNTIME_DIR=/tmp/xdg-run-1001`, created dir at build time and mounted as emptyDir at runtime.
+2. **`"/" is not a shared mount`** → Set `BUILDAH_ISOLATION=chroot` which bypasses mount propagation requirements entirely.
+3. **`cannot setup namespace using newuidmap` / `newuidmap: open of uid_map failed: Permission denied`** → Set `_CONTAINERS_USERNS_CONFIGURED=1` to bypass user namespace setup; falls back to single-UID mapping.
+4. **`Failed to decode the keys ["network.network_backend"]`** → Created clean `containers.conf` without that key; only safe defaults.
+5. **`mkdir /run/containers: permission denied`** → Changed `runroot` from `/run/user/1001` to `/tmp/containers-run-1001`.
+6. **chown errors in single-UID mapping** → Added `ignore_chown_errors = "true"` in `storage.conf` for both vfs and overlay.
+
+### Root pattern: VFS + chroot isolation
+- `STORAGE_DRIVER=vfs` — no kernel module deps, works with single-UID mapping, no fuse-overlayfs needed.
+- `BUILDAH_ISOLATION=chroot` — avoids runc/crun user namespace requirements (no unshare call).
+- `_CONTAINERS_USERNS_CONFIGURED=1` — tells containers libraries to skip newuidmap/newgidmap.
+- `ignore_chown_errors=true` — handles single-UID mapping where chown operations would fail.
+- Trade-off: VFS is slower than overlay (full copy vs reflink/copy-on-write), but universally compatible with unprivileged pods.
+
+### Three security tracks in `helm/runner-values-dind.yaml`
+- **Track A (strict non-root, default):** `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, drop ALL caps. Most restrictive. Works with VFS+chroot.
+- **Track B (hostUsers: false):** Requires Kubernetes 1.30+ with `UserNamespacesSupport` feature gate. Kernel maps UID range into pod; allows overlay storage and fuse-overlayfs.
+- **Track C (SETUID/SETGID caps):** For OpenShift `anyuid` SCC. Adds SETUID+SETGID caps + `allowPrivilegeEscalation: true`. Enables newuidmap/newgidmap for full user namespace support.
+
+### Files changed in Phase 3
+- `docker/runner-s390x-dind/Dockerfile` — complete rewrite with VFS+chroot config.
+- `helm/runner-values-dind.yaml` — NEW: dedicated DinD Helm values with Track A/B/C options.
+- `scripts/install/install-runner-scale-set.sh` — added `RUNNER_MODE` (dind|kubernetes) support.
+- `.env.example` — added `RUNNER_MODE=kubernetes`.
+- `scripts/test-dind-rootless.sh` — NEW: smoke test script.
+- `docs/test-dind-pod.yaml` — NEW: test pod manifest for cluster validation.
+
+### Images pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.1-s390x` — verified via registry API (User=1001, all 4 ENV vars confirmed, architecture=s390x).
+
+### Research sources
+- CERN blog: rootless container builds on Kubernetes (June 2025) — hostUsers: false + overlay + emptyDir pattern.
+- Red Hat OpenShift Pipelines docs: unprivileged buildah — SETUID/SETGID + allowPrivilegeEscalation pattern.
+- buildah GitHub issue #4049 / discussion #5720 — `cat /proc/self/uid_map` diagnosis.
+- oneuptime blog: rootless buildah in Kubernetes CI — VFS + chroot + SETUID/SETGID caps pattern.
+- buildah tutorial 05: OpenShift rootless with anyuid SCC.
+
 ## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)
 1. Fix `runner-s390x-dind` package installation path (Ubuntu apt packages vs UBI/microdnf) and align base/runtime assumptions.
@@ -74,9 +114,11 @@ applyTo: '**'
 4. Enable Dependabot updates for workflow actions and dependency review on PRs.
 
 ## Practical mode guidance for this project
-- Default mode for OpenShift/s390x: `containerMode: kubernetes`.
-- Only enable `dind`/`dind-rootless` for workloads that truly need Docker daemon semantics and can tolerate privileged SCC.
-- Prefer daemonless builders (buildah/kaniko/buildkit rootless patterns) where possible to avoid privileged pods.
+- Default mode for OpenShift/s390x: `containerMode: kubernetes` (safest, no privileged pods).
+- For workloads needing in-pod image builds: use DinD mode with `runner-values-dind.yaml` Track A (VFS+chroot, strict non-root).
+- Track B (hostUsers: false) is preferred when on Kubernetes 1.30+ — enables overlay storage for better build performance.
+- Track C (SETUID/SETGID caps) for OpenShift with `anyuid` SCC — enables newuidmap/newgidmap.
+- Prefer daemonless builders (buildah/kaniko) over Docker daemon; our DIND image uses podman/buildah (no dockerd).
 
 ## Decision rule to remember
 If a repository accepts untrusted PR code, route it to the most isolated ephemeral runner group with strict non-root + no privileged containers, and never share that pool with deployment-capable workloads.

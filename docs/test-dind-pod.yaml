@@ -1,0 +1,137 @@
+## Test pod for verifying rootless podman/buildah in the DIND runner image.
+## Deploy on an s390x cluster to validate that all errors are resolved.
+##
+## Usage:
+##   oc apply -f docs/test-dind-pod.yaml
+##   oc logs -f test-dind-rootless       # watch output
+##   oc delete pod test-dind-rootless    # cleanup
+##
+## Expected: All checks pass, buildah builds a trivial image, podman runs it.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-dind-rootless
+  labels:
+    app: arc-dind-test
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+
+  ## Pod-level security — matches runner-values-dind.yaml Track A
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    - name: test
+      ## Replace with your actual DIND image:
+      image: docker.io/annepdevops/actions-runner-dind:0.1.1-s390x
+      imagePullPolicy: Always
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "============================================"
+          echo "  DIND Rootless Smoke Test"
+          echo "============================================"
+          echo ""
+          echo "--- Environment ---"
+          echo "USER: $(whoami) ($(id))"
+          echo "BUILDAH_ISOLATION=${BUILDAH_ISOLATION:-not set}"
+          echo "STORAGE_DRIVER=${STORAGE_DRIVER:-not set}"
+          echo "_CONTAINERS_USERNS_CONFIGURED=${_CONTAINERS_USERNS_CONFIGURED:-not set}"
+          echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-not set}"
+          echo ""
+
+          echo "--- Writable directories ---"
+          for d in /tmp/xdg-run-1001 /tmp/containers-run-1001 /home/runner/.local/share/containers; do
+            if [ -w "$d" ]; then
+              echo "✅ $d writable"
+            else
+              echo "❌ $d NOT writable"; exit 1
+            fi
+          done
+          echo ""
+
+          echo "--- podman info ---"
+          podman --storage-driver=vfs info 2>&1 | grep -E "^(host|store|graphRoot|runRoot|graphDriverName)" || true
+          echo ""
+
+          echo "--- buildah info ---"
+          buildah --storage-driver=vfs info 2>&1 | head -15
+          echo ""
+
+          echo "--- Build trivial image ---"
+          mkdir -p /tmp/test-build && cd /tmp/test-build
+          cat > Dockerfile <<'EODF'
+          FROM docker.io/library/alpine:latest
+          RUN echo "hello from s390x rootless build" > /message.txt
+          CMD ["cat", "/message.txt"]
+          EODF
+
+          buildah --storage-driver=vfs bud --isolation chroot -t test-image:latest -f Dockerfile . 2>&1
+          echo ""
+
+          echo "--- List images ---"
+          buildah --storage-driver=vfs images 2>&1
+          echo ""
+
+          echo "--- Run container ---"
+          podman --storage-driver=vfs run --rm test-image:latest 2>&1
+          echo ""
+
+          echo "============================================"
+          echo "  ✅ ALL TESTS PASSED"
+          echo "============================================"
+
+      ## Container-level security — Track A (strict non-root)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false
+        capabilities:
+          drop:
+            - ALL
+
+      env:
+        - name: BUILDAH_ISOLATION
+          value: "chroot"
+        - name: STORAGE_DRIVER
+          value: "vfs"
+        - name: _CONTAINERS_USERNS_CONFIGURED
+          value: "1"
+        - name: XDG_RUNTIME_DIR
+          value: "/tmp/xdg-run-1001"
+
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "2Gi"
+
+      volumeMounts:
+        - name: containers-storage
+          mountPath: /home/runner/.local/share/containers
+        - name: tmp-runtime
+          mountPath: /tmp/containers-run-1001
+        - name: xdg-runtime
+          mountPath: /tmp/xdg-run-1001
+
+  volumes:
+    - name: containers-storage
+      emptyDir:
+        sizeLimit: 5Gi
+    - name: tmp-runtime
+      emptyDir: {}
+    - name: xdg-runtime
+      emptyDir: {}

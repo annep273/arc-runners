@@ -15,19 +15,31 @@ require_env RUNNER_SCALE_SET_NAME
 require_env GITHUB_CONFIG_URL
 require_env REGISTRY_HOST
 require_env REGISTRY_NAMESPACE
-require_env RUNNER_IMAGE_NAME
 require_env IMAGE_TAG
 
-print_header "Install ARC runner scale set"
+# Determine runner mode: "kubernetes" (default) or "dind"
+RUNNER_MODE="${RUNNER_MODE:-kubernetes}"
+
+print_header "Install ARC runner scale set (mode: ${RUNNER_MODE})"
 
 oc create namespace "${RUNNER_NAMESPACE}" --dry-run=client -o yaml | oc apply -f -
 
-RUNNER_IMAGE_FULL="${REGISTRY_HOST}/${REGISTRY_NAMESPACE}/${RUNNER_IMAGE_NAME}:${IMAGE_TAG}"
+if [[ "${RUNNER_MODE}" == "dind" ]]; then
+  require_env RUNNER_DIND_IMAGE_NAME
+  RUNNER_IMAGE_FULL="${REGISTRY_HOST}/${REGISTRY_NAMESPACE}/${RUNNER_DIND_IMAGE_NAME}:${IMAGE_TAG}"
+  VALUES_FILE="${REPO_ROOT}/helm/runner-values-dind.yaml"
+  echo "Using DinD image: ${RUNNER_IMAGE_FULL}"
+  echo "DinD values file: ${VALUES_FILE}"
+else
+  require_env RUNNER_IMAGE_NAME
+  RUNNER_IMAGE_FULL="${REGISTRY_HOST}/${REGISTRY_NAMESPACE}/${RUNNER_IMAGE_NAME}:${IMAGE_TAG}"
+  VALUES_FILE="${REPO_ROOT}/helm/runner-values.yaml"
+fi
 
 helm upgrade --install "${RUNNER_SCALE_SET_NAME}" \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
   --namespace "${RUNNER_NAMESPACE}" \
-  --values "${REPO_ROOT}/helm/runner-values.yaml" \
+  --values "${VALUES_FILE}" \
   --set githubConfigUrl="${GITHUB_CONFIG_URL}" \
   --set githubConfigSecret="arc-ghes-github-app" \
   --set "template.spec.containers[0].image=${RUNNER_IMAGE_FULL}" \
@@ -35,3 +47,4 @@ helm upgrade --install "${RUNNER_SCALE_SET_NAME}" \
   --set controllerServiceAccount.name="arc-gha-rs-controller"
 
 echo "Runner scale set installed: ${RUNNER_SCALE_SET_NAME} in namespace ${RUNNER_NAMESPACE}"
+echo "Mode: ${RUNNER_MODE} | Image: ${RUNNER_IMAGE_FULL}"
