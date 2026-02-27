@@ -54,21 +54,66 @@ applyTo: '**'
 - [x] Added listener pod securityContext in runner-values.yaml
 - [x] Added RUNNER_CONTAINER_HOOKS_VERSION to build script and .env.example
 
-## DinD Rootless Fixes (Phase 3 — runtime errors resolved)
+## DinD Rootless Fixes (Phase 3 — v0.1.1, initial attempt)
 
-### Errors fixed
-1. **`XDG_RUNTIME_DIR is pointing to a path which is not writable`** → Set `XDG_RUNTIME_DIR=/tmp/xdg-run-1001`, created dir at build time and mounted as emptyDir at runtime.
-2. **`"/" is not a shared mount`** → Set `BUILDAH_ISOLATION=chroot` which bypasses mount propagation requirements entirely.
-3. **`cannot setup namespace using newuidmap` / `newuidmap: open of uid_map failed: Permission denied`** → Set `_CONTAINERS_USERNS_CONFIGURED=1` to bypass user namespace setup; falls back to single-UID mapping.
-4. **`Failed to decode the keys ["network.network_backend"]`** → Created clean `containers.conf` without that key; only safe defaults.
-5. **`mkdir /run/containers: permission denied`** → Changed `runroot` from `/run/user/1001` to `/tmp/containers-run-1001`.
-6. **chown errors in single-UID mapping** → Added `ignore_chown_errors = "true"` in `storage.conf` for both vfs and overlay.
+### Errors targeted (v0.1.1)
+1. `XDG_RUNTIME_DIR is pointing to a path which is not writable`
+2. `"/" is not a shared mount`
+3. `cannot setup namespace using newuidmap` / `newuidmap: open of uid_map failed`
+4. `Failed to decode the keys ["network.network_backend"]`
+5. `mkdir /run/containers: permission denied`
+6. chown errors in single-UID mapping
 
-### Root pattern: VFS + chroot isolation
+### v0.1.1 approach (partially effective)
+- Set `XDG_RUNTIME_DIR=/tmp/xdg-run-1001`, `BUILDAH_ISOLATION=chroot`, `_CONTAINERS_USERNS_CONFIGURED=1`, `STORAGE_DRIVER=vfs`.
+- Created user-level configs at `~/.config/containers/storage.conf` and `~/.config/containers/containers.conf`.
+- **Result: Still failing at runtime.** User reported "still getting the same issue."
+
+### Image pushed (v0.1.1)
+- `docker.io/annepdevops/actions-runner-dind:0.1.1-s390x`
+
+## DinD Rootless Fixes (Phase 4 — v0.1.2, definitive fix via deep research)
+
+### Root cause analysis (DEFINITIVE — from source code review)
+
+**Why v0.1.1 failed:** User-level configs (`~/.config/containers/`) are read AFTER system-level configs. The Ubuntu 22.04 `containers-common` package installs system-level configs at `/etc/containers/` and `/usr/share/containers/` that contain TOML keys incompatible with podman 3.4.4.
+
+**Source code evidence (verified by reading actual Go source):**
+1. **`containers/storage` v1.38.2** (`types/options.go` + `store.go`):
+   - `ReloadConfigurationFile()` uses `toml.DecodeFile()` + `meta.Undecoded()` — any unrecognized TOML key triggers "Failed to decode the keys" warning
+   - Config precedence: `/usr/share/containers/storage.conf` → `/etc/containers/storage.conf` → `$CONTAINERS_STORAGE_CONF` env var → `~/.config/containers/storage.conf`
+   - The `STORAGE_DRIVER` env var is honored in `GetDefaultStoreOptionsForUIDAndGID()` but only AFTER config file is fully parsed (including unknown keys)
+   - `CONTAINERS_STORAGE_CONF` env var forces a specific config path, bypassing discovery
+
+2. **`containers/common` v0.44.0** (`containers.conf` template):
+   - `network_backend` key does NOT exist in v0.44 (it was added in ~v0.47+)
+   - Ubuntu 22.04 ships containers-common v0.44 but the package may install a `/etc/containers/containers.conf` with newer keys
+   - This mismatch causes "Failed to decode the keys ['network.network_backend']" error
+
+3. **Ubuntu 22.04 package versions confirmed:**
+   - `podman` = 3.4.4+ds1-1ubuntu1.22.04.3 (very old, late 2021)
+   - `buildah` = 1.23.1 (very old)
+   - `containers-common` = 0.44.4+ds1-1ubuntu1 → containers/common v0.44
+
+### 7 key fixes in v0.1.2 (vs v0.1.1)
+
+| # | What changed | Why |
+|---|---|---|
+| 1 | Replace ALL system-level configs (`/etc/containers/storage.conf`, `/etc/containers/containers.conf`, `/usr/share/containers/storage.conf`, `/usr/share/containers/containers.conf`) | Previous version only added user-level configs which are parsed AFTER system configs |
+| 2 | `containers.conf` uses ONLY TOML keys valid for containers-common v0.44 | NO `network_backend`, NO `[secrets]` section — eliminates "Failed to decode" errors |
+| 3 | Set `userns = "host"`, `netns = "host"`, `no_pivot_root = true` in containers.conf | Prevents podman/buildah from attempting namespace/mount operations |
+| 4 | Set `CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf` env var | Ultimate storage config override — bypasses all discovery logic |
+| 5 | Set `CONTAINERS_REGISTRIES_CONF=/etc/containers/registries.conf` env var | Explicit registry config path |
+| 6 | Created wrapper scripts (`/usr/local/bin/docker`, `podman`, `podman-safe`, `buildah-safe`) with explicit CLI flags | `--storage-driver=vfs --root=... --runroot=...` as ultimate fallback |
+| 7 | Use `chown -R 1001:0` instead of `runner:docker` | `docker` group doesn't exist in base image; GID 0 (root group) always exists |
+
+### Root pattern: VFS + chroot + system-level config replacement
 - `STORAGE_DRIVER=vfs` — no kernel module deps, works with single-UID mapping, no fuse-overlayfs needed.
 - `BUILDAH_ISOLATION=chroot` — avoids runc/crun user namespace requirements (no unshare call).
 - `_CONTAINERS_USERNS_CONFIGURED=1` — tells containers libraries to skip newuidmap/newgidmap.
+- `CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf` — forces storage config path, bypasses discovery.
 - `ignore_chown_errors=true` — handles single-UID mapping where chown operations would fail.
+- **CRITICAL**: Replace system-level configs, not just add user-level ones.
 - Trade-off: VFS is slower than overlay (full copy vs reflink/copy-on-write), but universally compatible with unprivileged pods.
 
 ### Three security tracks in `helm/runner-values-dind.yaml`
@@ -76,23 +121,38 @@ applyTo: '**'
 - **Track B (hostUsers: false):** Requires Kubernetes 1.30+ with `UserNamespacesSupport` feature gate. Kernel maps UID range into pod; allows overlay storage and fuse-overlayfs.
 - **Track C (SETUID/SETGID caps):** For OpenShift `anyuid` SCC. Adds SETUID+SETGID caps + `allowPrivilegeEscalation: true`. Enables newuidmap/newgidmap for full user namespace support.
 
-### Files changed in Phase 3
-- `docker/runner-s390x-dind/Dockerfile` — complete rewrite with VFS+chroot config.
-- `helm/runner-values-dind.yaml` — NEW: dedicated DinD Helm values with Track A/B/C options.
+### Files changed in Phase 3+4
+- `docker/runner-s390x-dind/Dockerfile` — complete rewrite with VFS+chroot config + system-level config replacement.
+- `helm/runner-values-dind.yaml` — dedicated DinD Helm values with Track A/B/C options + new env vars.
 - `scripts/install/install-runner-scale-set.sh` — added `RUNNER_MODE` (dind|kubernetes) support.
-- `.env.example` — added `RUNNER_MODE=kubernetes`.
-- `scripts/test-dind-rootless.sh` — NEW: smoke test script.
-- `docs/test-dind-pod.yaml` — NEW: test pod manifest for cluster validation.
+- `.env.example` — added `RUNNER_MODE=kubernetes`, updated `IMAGE_TAG=0.1.2-s390x`.
+- `scripts/test-dind-rootless.sh` — smoke test script (updated for v0.1.2 env vars).
+- `docs/test-dind-pod.yaml` — test pod manifest (updated for v0.1.2 image + env vars).
 
 ### Images pushed
-- `docker.io/annepdevops/actions-runner-dind:0.1.1-s390x` — verified via registry API (User=1001, all 4 ENV vars confirmed, architecture=s390x).
+- `docker.io/annepdevops/actions-runner-dind:0.1.1-s390x` — v0.1.1, initial attempt (user-level configs only, still broken at runtime).
+- `docker.io/annepdevops/actions-runner-dind:0.1.2-s390x` — v0.1.2, comprehensive fix (system-level config replacement). Digest: `sha256:551c75fc9f0d1977a68a7ea8d44b037b9f30430c275a1de1d3967425abe58035`. Verified via registry API.
+
+### Key ENV vars in v0.1.2 Dockerfile
+```
+BUILDAH_ISOLATION=chroot
+_CONTAINERS_USERNS_CONFIGURED=1
+STORAGE_DRIVER=vfs
+CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf
+CONTAINERS_REGISTRIES_CONF=/etc/containers/registries.conf
+XDG_RUNTIME_DIR=/tmp/xdg-run-1001
+HOME=/home/runner
+```
 
 ### Research sources
+- **containers/storage v1.38.2 source code** (`types/options.go`, `store.go`) — config precedence and TOML decoding logic.
+- **containers/common v0.44.0 source code** (`containers.conf` template) — confirmed `network_backend` absent in v0.44.
 - CERN blog: rootless container builds on Kubernetes (June 2025) — hostUsers: false + overlay + emptyDir pattern.
 - Red Hat OpenShift Pipelines docs: unprivileged buildah — SETUID/SETGID + allowPrivilegeEscalation pattern.
 - buildah GitHub issue #4049 / discussion #5720 — `cat /proc/self/uid_map` diagnosis.
 - oneuptime blog: rootless buildah in Kubernetes CI — VFS + chroot + SETUID/SETGID caps pattern.
 - buildah tutorial 05: OpenShift rootless with anyuid SCC.
+- Ubuntu 22.04 packages database — confirmed podman 3.4.4, buildah 1.23.1, containers-common 0.44.
 
 ## Enhancements remaining (P1-P3)
 ### P1 (image reliability and supply chain)

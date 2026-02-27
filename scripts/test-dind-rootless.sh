@@ -11,7 +11,7 @@
 # Usage:
 #   bash scripts/test-dind-rootless.sh [IMAGE]
 #
-# Default image: docker.io/annepdevops/actions-runner-dind:0.1.1-s390x
+# Default image: docker.io/annepdevops/actions-runner-dind:0.1.2-s390x
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -46,6 +46,9 @@ echo "BUILDAH_ISOLATION: ${BUILDAH_ISOLATION:-not set}"
 echo "STORAGE_DRIVER: ${STORAGE_DRIVER:-not set}"
 echo "_CONTAINERS_USERNS_CONFIGURED: ${_CONTAINERS_USERNS_CONFIGURED:-not set}"
 echo "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-not set}"
+echo "CONTAINERS_STORAGE_CONF: ${CONTAINERS_STORAGE_CONF:-not set}"
+echo "CONTAINERS_REGISTRIES_CONF: ${CONTAINERS_REGISTRIES_CONF:-not set}"
+echo "HOME: ${HOME:-not set}"
 echo ""
 
 echo "=== Verify writable directories ==="
@@ -59,21 +62,25 @@ for d in /tmp/xdg-run-1001 /tmp/containers-run-1001 /home/runner/.local/share/co
 done
 echo ""
 
-echo "=== storage.conf ==="
-cat /home/runner/.config/containers/storage.conf
+echo "=== System storage.conf ==="
+cat /etc/containers/storage.conf 2>&1 | head -10
 echo ""
 
-echo "=== containers.conf ==="
-cat /home/runner/.config/containers/containers.conf
+echo "=== System containers.conf ==="
+cat /etc/containers/containers.conf 2>&1 | head -10
 echo ""
 
-echo "=== podman info ==="
-podman --storage-driver=vfs info 2>&1 | head -30
+echo "=== User storage.conf ==="
+cat /home/runner/.config/containers/storage.conf 2>&1 | head -5 || echo "(not found)"
+echo ""
+
+echo "=== podman info (via wrapper) ==="
+podman info 2>&1 | head -30
 echo "..."
 echo ""
 
 echo "=== buildah info ==="
-buildah --storage-driver=vfs info 2>&1 | head -20
+buildah-safe info 2>&1 | head -20 || buildah --storage-driver=vfs info 2>&1 | head -20
 echo "..."
 echo ""
 
@@ -84,16 +91,16 @@ FROM docker.io/library/alpine:latest
 RUN echo "hello from s390x rootless build"
 EODF
 
-echo "Starting buildah build..."
-buildah --storage-driver=vfs bud --isolation chroot -t test-image:latest -f Dockerfile . 2>&1
+echo "Starting buildah build (via wrapper)..."
+buildah-safe bud -t test-image:latest -f Dockerfile . 2>&1
 echo ""
 
 echo "=== List built images ==="
-buildah --storage-driver=vfs images
+podman images 2>&1
 echo ""
 
 echo "=== Run container with podman ==="
-podman --storage-driver=vfs run --rm test-image:latest echo "Container ran successfully!" 2>&1
+podman run --rm test-image:latest echo "Container ran successfully!" 2>&1
 echo ""
 
 echo "============================================"
@@ -114,6 +121,9 @@ docker run --rm \
   -e _CONTAINERS_USERNS_CONFIGURED=1 \
   -e STORAGE_DRIVER=vfs \
   -e XDG_RUNTIME_DIR=/tmp/xdg-run-1001 \
+  -e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
+  -e CONTAINERS_REGISTRIES_CONF=/etc/containers/registries.conf \
+  -e HOME=/home/runner \
   --entrypoint /bin/bash \
   "${IMAGE}" \
   -c "${TEST_SCRIPT}"

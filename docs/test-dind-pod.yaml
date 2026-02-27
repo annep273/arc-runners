@@ -30,7 +30,7 @@ spec:
   containers:
     - name: test
       ## Replace with your actual DIND image:
-      image: docker.io/annepdevops/actions-runner-dind:0.1.1-s390x
+      image: docker.io/annepdevops/actions-runner-dind:0.1.2-s390x
       imagePullPolicy: Always
 
       command: ["/bin/bash", "-c"]
@@ -38,7 +38,7 @@ spec:
         - |
           set -e
           echo "============================================"
-          echo "  DIND Rootless Smoke Test"
+          echo "  DIND Rootless Smoke Test (v2)"
           echo "============================================"
           echo ""
           echo "--- Environment ---"
@@ -47,24 +47,36 @@ spec:
           echo "STORAGE_DRIVER=${STORAGE_DRIVER:-not set}"
           echo "_CONTAINERS_USERNS_CONFIGURED=${_CONTAINERS_USERNS_CONFIGURED:-not set}"
           echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-not set}"
+          echo "CONTAINERS_STORAGE_CONF=${CONTAINERS_STORAGE_CONF:-not set}"
+          echo "CONTAINERS_REGISTRIES_CONF=${CONTAINERS_REGISTRIES_CONF:-not set}"
+          echo "HOME=${HOME:-not set}"
+          echo ""
+
+          echo "--- Config files ---"
+          echo "System storage.conf:"
+          cat /etc/containers/storage.conf 2>&1 | head -5
+          echo "System containers.conf:"
+          cat /etc/containers/containers.conf 2>&1 | head -5
+          echo "User storage.conf:"
+          cat ~/.config/containers/storage.conf 2>&1 | head -5 || echo "(not found)"
           echo ""
 
           echo "--- Writable directories ---"
           for d in /tmp/xdg-run-1001 /tmp/containers-run-1001 /home/runner/.local/share/containers; do
             if [ -w "$d" ]; then
-              echo "✅ $d writable"
+              echo "OK $d writable"
             else
-              echo "❌ $d NOT writable"; exit 1
+              echo "FAIL $d NOT writable"; exit 1
             fi
           done
           echo ""
 
-          echo "--- podman info ---"
-          podman --storage-driver=vfs info 2>&1 | grep -E "^(host|store|graphRoot|runRoot|graphDriverName)" || true
+          echo "--- podman info (via wrapper) ---"
+          podman info 2>&1 | grep -iE "(graphRoot|runRoot|graphDriverName|driver)" | head -10 || true
           echo ""
 
           echo "--- buildah info ---"
-          buildah --storage-driver=vfs info 2>&1 | head -15
+          buildah-safe info 2>&1 | head -15 || buildah --storage-driver=vfs info 2>&1 | head -15
           echo ""
 
           echo "--- Build trivial image ---"
@@ -75,19 +87,20 @@ spec:
           CMD ["cat", "/message.txt"]
           EODF
 
-          buildah --storage-driver=vfs bud --isolation chroot -t test-image:latest -f Dockerfile . 2>&1
+          echo "Building with buildah-safe..."
+          buildah-safe bud -t test-image:latest -f Dockerfile . 2>&1
           echo ""
 
           echo "--- List images ---"
-          buildah --storage-driver=vfs images 2>&1
+          podman images 2>&1
           echo ""
 
           echo "--- Run container ---"
-          podman --storage-driver=vfs run --rm test-image:latest 2>&1
+          podman run --rm test-image:latest 2>&1
           echo ""
 
           echo "============================================"
-          echo "  ✅ ALL TESTS PASSED"
+          echo "  ALL TESTS PASSED"
           echo "============================================"
 
       ## Container-level security — Track A (strict non-root)
@@ -110,6 +123,12 @@ spec:
           value: "1"
         - name: XDG_RUNTIME_DIR
           value: "/tmp/xdg-run-1001"
+        - name: CONTAINERS_STORAGE_CONF
+          value: "/etc/containers/storage.conf"
+        - name: CONTAINERS_REGISTRIES_CONF
+          value: "/etc/containers/registries.conf"
+        - name: HOME
+          value: "/home/runner"
 
       resources:
         requests:

@@ -108,6 +108,12 @@ template:
             value: "1"
           - name: XDG_RUNTIME_DIR
             value: "/tmp/xdg-run-1001"
+          - name: CONTAINERS_STORAGE_CONF
+            value: "/etc/containers/storage.conf"
+          - name: CONTAINERS_REGISTRIES_CONF
+            value: "/etc/containers/registries.conf"
+          - name: HOME
+            value: "/home/runner"
 
           ## ── Track B env overrides (uncomment if using hostUsers: false) ──
           ## Override storage to overlay for better performance.
@@ -115,6 +121,8 @@ template:
           #   value: "overlay"
           # - name: _CONTAINERS_USERNS_CONFIGURED
           #   value: ""
+          # - name: CONTAINERS_STORAGE_CONF
+          #   value: ""  # let podman auto-discover
 
         resources:
           requests:
