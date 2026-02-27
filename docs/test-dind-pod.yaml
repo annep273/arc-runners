@@ -30,7 +30,7 @@ spec:
   containers:
     - name: test
       ## Replace with your actual DIND image:
-      image: docker.io/annepdevops/actions-runner-dind:0.1.2-s390x
+      image: docker.io/annepdevops/actions-runner-dind:0.1.3-s390x
       imagePullPolicy: Always
 
       command: ["/bin/bash", "-c"]

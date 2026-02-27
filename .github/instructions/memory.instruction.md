@@ -148,6 +148,46 @@ HOME=/home/runner
 - **containers/storage v1.38.2 source code** (`types/options.go`, `store.go`) — config precedence and TOML decoding logic.
 - **containers/common v0.44.0 source code** (`containers.conf` template) — confirmed `network_backend` absent in v0.44.
 - CERN blog: rootless container builds on Kubernetes (June 2025) — hostUsers: false + overlay + emptyDir pattern.
+
+## DinD Rootless Fixes (Phase 5 — v0.1.3, lchown/ignore_chown_errors fix)
+
+### v0.1.2 runtime errors (reported by user)
+1. `Failed to decode the keys ["network.network_backend"]` — STILL present (likely ARC or volume mount recreating user-level config)
+2. `error running newuidmap/newgidmap` — WARNING only, expected with `_CONTAINERS_USERNS_CONFIGURED=1`
+3. **CRITICAL**: `ApplyLayer exit status 1: potentially insufficient UIDs or GIDs available in user namespace (requested 0:42 for /etc/gshadow): lchown /etc/gshadow: invalid argument` — Fatal during layer extraction
+
+### Root cause analysis (from containers/storage v1.38.2 source code)
+
+**Why v0.1.2 failed:** Two issues:
+
+1. **`ignore_chown_errors` placement**: Was under `[storage.options.overlay]` and `[storage.options.vfs]` per-driver subsections only. containers/storage v1.38.2 VFS driver `Init()` parses `DriverOptions` which come from the **global** `[storage.options]` map, NOT from per-driver TOML subsections. The VFS-specific subsection `[storage.options.vfs]` was added in newer versions. Fix: put `ignore_chown_errors = "true"` at global `[storage.options]` level.
+
+2. **Wrapper scripts naming**: Were named `podman-safe`/`buildah-safe` at `/usr/local/bin/`. CI workflows calling `buildah bud` or `podman build` directly resolved to `/usr/bin/buildah` which lacks `--storage-opt ignore_chown_errors=true` flag.
+
+**Source code evidence (verified by reading Go source):**
+- `drivers/vfs/driver.go` `Init()`: parses `".ignore_chown_errors"` and `"vfs.ignore_chown_errors"` from `options.DriverOptions` → sets `d.ignoreChownErrors`
+- `drivers/vfs/driver.go` `ApplyDiff()`: sets `options.IgnoreChownErrors = d.ignoreChownErrors` → calls `d.naiveDiff.ApplyDiff()`
+- `drivers/driver.go`: `ApplyDiffOpts` struct has `IgnoreChownErrors bool` and `ForceMask *os.FileMode`
+- `pkg/archive/archive.go` `createTarFile()`: calls `idtools.SafeLchown()` → if error AND `ignoreChownErrors` → prints warning but continues. Error "lchown /etc/gshadow: invalid argument" happens here when `ignoreChownErrors` is false.
+- `pkg/archive/diff.go` `UnpackLayer()`: passes `IgnoreChownErrors` and `ForceMask` through to `createTarFile`
+- Unix StackExchange confirmed: `ignore_chown_errors` must be at global `[storage.options]` level for v1.38.x
+
+### 3 key fixes in v0.1.3 (vs v0.1.2)
+
+| # | What changed | Why |
+|---|---|---|
+| 1 | Added `ignore_chown_errors = "true"` at **global `[storage.options]`** level | containers/storage v1.38.2 reads DriverOptions from global options map, not per-driver subsections |
+| 2 | Renamed wrappers from `podman-safe`/`buildah-safe` to `podman`/`buildah`/`docker` at `/usr/local/bin/` | PATH priority over `/usr/bin/` ensures ALL direct calls get correct flags |
+| 3 | Added `--storage-opt ignore_chown_errors=true` to ALL wrapper scripts | Belt-and-suspenders: CLI flag overrides config even if config parsing fails |
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.3-s390x` — v0.1.3, lchown/ignore_chown_errors fix. Digest: `sha256:53424b8cd54966916d667bfb87149daa11b0fb98d5858b90468e9b1cd8965fbf`. Verified via registry API.
+
+### Files updated
+- `docker/runner-s390x-dind/Dockerfile` — storage.conf global `[storage.options]` + direct wrapper scripts
+- `.env.example` — `IMAGE_TAG=0.1.3-s390x`
+- `docs/test-dind-pod.yaml` — image tag bumped to v0.1.3
+- `scripts/test-dind-rootless.sh` — image tag bumped to v0.1.3
 - Red Hat OpenShift Pipelines docs: unprivileged buildah — SETUID/SETGID + allowPrivilegeEscalation pattern.
 - buildah GitHub issue #4049 / discussion #5720 — `cat /proc/self/uid_map` diagnosis.
 - oneuptime blog: rootless buildah in Kubernetes CI — VFS + chroot + SETUID/SETGID caps pattern.

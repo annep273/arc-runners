@@ -86,6 +86,11 @@ runroot = "/tmp/containers-run-1001"
 graphroot = "/home/runner/.local/share/containers/storage"
 
 [storage.options]
+# CRITICAL: ignore_chown_errors MUST be at global [storage.options] level
+# to be propagated as a DriverOption to the VFS driver init.
+# Per-driver subsections ([storage.options.vfs]) may NOT be parsed by
+# containers/storage v1.38.2 (shipped with podman 3.4.4).
+ignore_chown_errors = "true"
 pull_options = {enable_partial_images = "false", use_hard_links = "false", ostree_repos=""}
 
 [storage.options.overlay]
@@ -216,14 +221,22 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.local
 
 # ── Wrapper scripts with explicit CLI flags ──────────────────────────
-# These wrappers ensure VFS + chroot are used even if config files are
-# somehow not read (e.g. early parse failure, volume mount shadowing).
-# They also provide a 'docker' command that maps to podman.
-RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  "$@"\n' > /usr/local/bin/podman-safe && \
-    printf '#!/bin/sh\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --isolation=chroot \\\n  "$@"\n' > /usr/local/bin/buildah-safe && \
-    printf '#!/bin/sh\n# Map docker to podman with explicit VFS/rootless flags\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  "$@"\n' > /usr/local/bin/docker && \
-    chmod +x /usr/local/bin/podman-safe /usr/local/bin/buildah-safe /usr/local/bin/docker && \
-    ln -sf /usr/local/bin/docker /usr/local/bin/podman
+# These wrappers ensure VFS + chroot + ignore_chown_errors are used even
+# if config files are not read (e.g. early parse failure, volume mount
+# shadowing, or old containers/storage not parsing [storage.options.vfs]).
+#
+# CRITICAL: Wrappers are at /usr/local/bin/{podman,buildah,docker} which
+# takes priority over /usr/bin/{podman,buildah} in PATH. This ensures
+# that ANY call to 'podman build' or 'buildah bud' from CI workflows
+# automatically gets the right flags.
+#
+# --storage-opt ignore_chown_errors=true is THE fix for:
+#   "lchown /etc/gshadow: invalid argument" in single-UID rootless mode
+RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
+
+RUN printf '#!/bin/sh\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  --isolation=chroot \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
+
+RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
 
 # ── Validate configs at build time ───────────────────────────────────
 # Quick sanity check: ensure podman can read the config without errors.
