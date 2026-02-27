@@ -152,12 +152,39 @@ RUN cp /etc/containers/registries.conf /usr/share/containers/registries.conf
 # ── policy.json — required for image pulls ───────────────────────────
 RUN echo '{"default":[{"type":"insecureAcceptAnything"}]}' > /etc/containers/policy.json
 
-# ── User-level configs (belt-and-suspenders for rootless mode) ───────
+# ── APT sandbox workaround for rootless builds ──────────────────────
+# When buildah builds Debian/Ubuntu images with chroot isolation,
+# apt-get tries to drop privileges to _apt user via setgroups(65534).
+# This fails because:
+#   1. The kernel sets /proc/PID/setgroups to "deny" in unprivileged
+#      user namespaces (security requirement before writing gid_map)
+#   2. With chroot isolation + single-UID mapping, there's no way to
+#      call setgroups() or seteuid() to switch to other UIDs/GIDs
+# Fix: APT::Sandbox::User "root" tells apt to skip privilege dropping.
+# Since we're already unprivileged, there's nothing to drop.
+RUN mkdir -p /etc/apt/apt.conf.d && \
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99sandbox
+
+# ── Default mounts for buildah builds ────────────────────────────────
+# mounts.conf tells buildah to auto-inject files into every container
+# it builds (via setupMounts → subscriptions.MountsWithUIDGID).
+# This injects the apt sandbox config into Debian/Ubuntu build containers
+# so RUN apt-get commands work without modification.
+# For non-Debian containers, the file is harmlessly present.
+# Source: containers/common pkg/subscriptions/subscriptions.go
+RUN echo '/etc/apt/apt.conf.d/99sandbox:/etc/apt/apt.conf.d/99sandbox' \
+      > /usr/share/containers/mounts.conf
+
+# ── User-level configs (symlinked to system for safety) ──────────────
 # When running as UID 1001, podman reads user configs AFTER system configs.
-# These duplicate the system configs as an extra safety layer.
+# ARC or workflow steps may create ~/.config/containers/containers.conf
+# with keys not understood by podman 3.4.4 (e.g. network_backend).
+# Using SYMLINKS ensures the user config always points to our clean
+# system config. If something overwrites the symlink, the wrapper
+# scripts will recreate it before each invocation.
 RUN mkdir -p /home/runner/.config/containers && \
     cp /etc/containers/storage.conf    /home/runner/.config/containers/storage.conf && \
-    cp /etc/containers/containers.conf /home/runner/.config/containers/containers.conf && \
+    ln -sf /etc/containers/containers.conf /home/runner/.config/containers/containers.conf && \
     cp /etc/containers/registries.conf /home/runner/.config/containers/registries.conf
 
 # ── Environment for rootless container-in-container ──────────────────
@@ -248,6 +275,7 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
 #
 # IMPORTANT for buildah 1.23.1:
 #   --storage-driver, --storage-opt ARE global (PersistentFlags)
+#   --default-mounts-file IS a global flag (PersistentFlag)
 #   --isolation is NOT a global flag — it's only valid on subcommands
 #   (bud, from, run). Use BUILDAH_ISOLATION=chroot env var instead.
 #
@@ -255,14 +283,19 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
 #   Valid:   vfs.ignore_chown_errors=true
 #   Invalid: ignore_chown_errors=true  (causes "does not support" error)
 #
+# Each wrapper also repairs the user-level containers.conf symlink
+# before every invocation. This prevents "Failed to decode the keys
+# [network.network_backend]" warnings caused by ARC or workflow steps
+# creating a user containers.conf with keys unknown to podman 3.4.4.
+#
 # We do NOT force --root/--runroot here — storage paths come from
 # CONTAINERS_STORAGE_CONF or the workflow's own storage.conf.
 # This avoids conflicts with workflows that configure their own paths.
-RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
+RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
 
-RUN printf '#!/bin/sh\n# NOTE: --isolation is NOT a global buildah flag.\n# Use BUILDAH_ISOLATION=chroot env var (already set in image).\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
+RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\n# NOTE: --isolation is NOT a global buildah flag.\n# Use BUILDAH_ISOLATION=chroot env var (already set in image).\n# --default-mounts-file injects apt sandbox config into build containers.\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  --default-mounts-file=/usr/share/containers/mounts.conf \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
 
-RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
+RUN printf '#!/bin/sh\n# Repair user containers.conf symlink (prevents network_backend warning)\nif [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then\n  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null\n  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null\nfi\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
 
 # ── Validate configs at build time ───────────────────────────────────
 # Quick sanity check: ensure podman can read the config without errors.

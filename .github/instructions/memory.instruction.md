@@ -293,16 +293,81 @@ exec /usr/bin/podman \
 ### Image pushed
 - `docker.io/annepdevops/actions-runner-dind:0.1.4-s390x` — v0.1.4, definitive fix. Digest: `sha256:3ee4bfde6906194d6e26f1a5fc63a50607020f4b797b4c98400dca699a0d7298`. Verified via registry API.
 
-### Research sources (Phase 6)
-- **containers/storage v1.38.2 `drivers/vfs/driver.go`** — VFS `parseOptions()` switch statement: only `.ignore_chown_errors` and `vfs.ignore_chown_errors` accepted
-- **containers/storage v1.38.2 `types/options.go`** — `ReloadConfigurationFile()` adds driver prefix to config-based options; `STORAGE_OPTS` replaces all GraphDriverOptions
-- **containers/storage v1.38.2 `pkg/config/config.go`** — `GetGraphDriverOptions("vfs", ...)` maps `[storage.options.vfs]` to prefixed options
-- **containers/common v0.44.0 `pkg/config/config.go`** — `CONTAINERS_CONF` env var forces single-config-file mode
-- **buildah v1.23.1 `cmd/buildah/main.go`** — global PersistentFlags confirmed (no `--isolation`)
-- Red Hat OpenShift Pipelines docs 1.17 — unprivileged buildah requires `allowPrivilegeEscalation + SETUID/SETGID` OR user namespaces
-- GitLab CI rootless buildah tutorial — same pattern: VFS + chroot + anyuid SCC
-- OneUptime blog (Feb 2026) — all examples use `capabilities: {add: [SETUID, SETGID]}`
-- buildah issue #5744 — maintainer nalind confirms `ignore_chown_errors` handles layer blob extraction
+## DinD Rootless Fixes (Phase 7 — v0.1.5, apt-get sandbox + network_backend symlink)
+
+### v0.1.4 runtime errors (reported by user)
+1. `E: setgroups 65534 failed - setgroups (1: Operation not permitted)` — **FATAL**: apt-get sandbox drops privileges to `_apt` user, fails.
+2. `E: seteuid 100 failed - seteuid (22: Invalid argument)` — same issue, apt's HTTP method can't change UID.
+3. `E: Method gave invalid 400 URI Failure message: Failed to setgroups` — HTTP fetcher dies.
+4. `Failed to decode the keys ["network.network_backend"]` — STILL appearing from `~/.config/containers/containers.conf`.
+5. Build exits with status 100 (apt-get failure).
+
+### Root cause analysis
+
+**Why v0.1.4 failed — TWO confirmed root causes:**
+
+1. **apt-get sandbox privilege dropping (FATAL):**
+   - When buildah builds Debian/Ubuntu images with chroot isolation, `RUN apt-get update` executes inside a chrooted rootfs.
+   - apt-get tries to drop privileges to `_apt` user (UID 100, GID 65534/nogroup) via `setgroups()` and `seteuid()`.
+   - With chroot isolation, buildah creates a user namespace + mount namespace (confirmed from `chroot/run.go`: `cmd.UnshareFlags = CLONE_NEWUTS | CLONE_NEWNS`).
+   - The kernel sets `/proc/PID/setgroups` to "deny" in unprivileged user namespaces (required before writing gid_map). Once "deny" is set, `setgroups()` returns EPERM.
+   - Fix: `APT::Sandbox::User "root"` tells apt-get to skip privilege dropping entirely. Since we're already unprivileged, there's nothing to drop.
+
+2. **`network_backend` warning persists despite CONTAINERS_CONF:**
+   - Despite setting `CONTAINERS_CONF=/etc/containers/containers.conf` in ENV, the warning still appears.
+   - Likely cause: ARC runner or workflow step overwrites `~/.config/containers/containers.conf` at runtime with a config containing `network_backend` key.
+   - In v0.1.4 we COPIED our clean config to the user path. If overwritten, the clean config is lost.
+   - Fix: Use a SYMLINK (`ln -sf /etc/containers/containers.conf ~/.config/containers/containers.conf`). Reads through the symlink get our clean config. If the symlink is overwritten, wrapper scripts repair it before every invocation.
+
+### Delivery mechanism for apt sandbox fix
+- **buildah chroot/run.go `setupChrootBindMounts()`**: confirmed that ALL `spec.Mounts` entries are processed as actual `unix.Mount()` bind mounts within the mount namespace.
+- **subscriptions.MountsWithUIDGID()**: reads `DefaultMountsFilePath` (default: `/usr/share/containers/mounts.conf`) and returns mount specs for each line.
+- **`--default-mounts-file`**: confirmed as a PersistentFlag in buildah 1.23.1 — can be passed globally.
+- Pipeline: `mounts.conf` → `subscriptions.MountsWithUIDGID()` → `spec.Mounts` → `setupChrootBindMounts()` → `unix.Mount()` bind mount of `/etc/apt/apt.conf.d/99sandbox` into build container rootfs.
+
+### 4 key fixes in v0.1.5 (vs v0.1.4)
+
+| # | What changed | Why |
+|---|---|---|
+| 1 | Created `/etc/apt/apt.conf.d/99sandbox` with `APT::Sandbox::User "root";` | Disables apt privilege dropping in all build containers |
+| 2 | Created `/usr/share/containers/mounts.conf` to auto-inject `99sandbox` | buildah's subscriptions mechanism bind-mounts this into every RUN step |
+| 3 | buildah wrapper adds `--default-mounts-file=/usr/share/containers/mounts.conf` | Belt-and-suspenders: explicitly points to mounts.conf |
+| 4 | User containers.conf is now a SYMLINK + wrapper scripts repair it before each run | Prevents overwritten user-level config from causing decode warnings |
+
+### Wrapper scripts (v0.1.5)
+All wrappers now include symlink repair before execution:
+```sh
+# /usr/local/bin/podman (and /usr/local/bin/docker)
+#!/bin/sh
+# Repair user containers.conf symlink (prevents network_backend warning)
+if [ ! -L "$HOME/.config/containers/containers.conf" ] 2>/dev/null; then
+  rm -f "$HOME/.config/containers/containers.conf" 2>/dev/null
+  ln -sf /etc/containers/containers.conf "$HOME/.config/containers/containers.conf" 2>/dev/null
+fi
+exec /usr/bin/podman \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+
+# /usr/local/bin/buildah (adds --default-mounts-file)
+#!/bin/sh
+# (same symlink repair)
+exec /usr/bin/buildah \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  --default-mounts-file=/usr/share/containers/mounts.conf \
+  "$@"
+```
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.5-s390x` — v0.1.5, apt sandbox + symlink fix. Digest: `sha256:7e637f3a961aeae906c1cee09bdaa04cc05d6b5c0957a14dbff225dde779ba04`. Verified via registry API.
+
+### Research sources (Phase 7)
+- **buildah v1.23.1 `chroot/run.go`** — confirmed `setupChrootBindMounts()` processes ALL `spec.Mounts` with `unix.Mount()`; confirmed `cmd.UnshareFlags = CLONE_NEWUTS | CLONE_NEWNS`
+- **buildah v1.23.1 `run_linux.go`** — confirmed `subscriptions.MountsWithUIDGID(b.MountLabel, cdir, b.DefaultMountsFilePath, ...)` reads mounts.conf
+- **containers/common v0.44.0 `pkg/config/config.go`** — re-confirmed `systemConfigs()` + `rootlessConfigPath()` paths
+- **Ubuntu Manpage ch-image** — confirmed `APT::Sandbox::User "root"` approach
+- **DuckDuckGo search results** — confirmed `APT::Sandbox::User` disables privilege dropping, `/etc/apt/apt.conf.d/99sandbox` is the standard location
 
 ### Files updated
 - `docker/runner-s390x-dind/Dockerfile` — storage.conf global `[storage.options]` + direct wrapper scripts
