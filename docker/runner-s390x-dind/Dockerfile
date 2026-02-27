@@ -184,6 +184,25 @@ RUN mkdir -p /home/runner/.config/containers && \
 # CONTAINERS_REGISTRIES_CONF:
 #   Forces registries config path.
 #
+# CONTAINERS_CONF:
+#   Forces containers/common to read ONLY our containers.conf file.
+#   When set, systemConfigs() returns ONLY this path — skipping
+#   /usr/share/containers/containers.conf, /etc/containers/containers.conf,
+#   AND ~/.config/containers/containers.conf. This prevents workflows
+#   from creating a user-level containers.conf with keys like
+#   network_backend that podman 3.4.4 doesn't understand.
+#   Source: containers/common v0.44 pkg/config/config.go systemConfigs()
+#
+# STORAGE_OPTS=vfs.ignore_chown_errors=true:
+#   Directly sets GraphDriverOptions via env var. The 'vfs.' prefix is
+#   REQUIRED — containers/storage v1.38.2 VFS driver parseOptions()
+#   only accepts '.ignore_chown_errors' or 'vfs.ignore_chown_errors'.
+#   Without the prefix, the driver returns:
+#     "vfs driver does not support ignore_chown_errors options"
+#   Note: STORAGE_OPTS REPLACES all config-file GraphDriverOptions.
+#   For VFS, ignore_chown_errors is the only relevant option, so this
+#   is safe. Source: types/options.go ReloadConfigurationFile()
+#
 # XDG_RUNTIME_DIR:
 #   Must point to a writable directory. Default /run/user/1001 does not
 #   exist in Kubernetes pods. We create it under /tmp.
@@ -195,6 +214,8 @@ ENV BUILDAH_ISOLATION=chroot \
     STORAGE_DRIVER=vfs \
     CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf \
     CONTAINERS_REGISTRIES_CONF=/etc/containers/registries.conf \
+    CONTAINERS_CONF=/etc/containers/containers.conf \
+    STORAGE_OPTS=vfs.ignore_chown_errors=true \
     XDG_RUNTIME_DIR=/tmp/xdg-run-1001 \
     HOME=/home/runner
 
@@ -221,27 +242,33 @@ RUN mkdir -p /tmp/xdg-run-1001 && \
     chown -R 1001:0 /home/runner/.local
 
 # ── Wrapper scripts with explicit CLI flags ──────────────────────────
-# These wrappers ensure VFS + chroot + ignore_chown_errors are used even
-# if config files are not read (e.g. early parse failure, volume mount
-# shadowing, or old containers/storage not parsing [storage.options.vfs]).
+# Belt-and-suspenders: env vars (STORAGE_DRIVER, STORAGE_OPTS,
+# BUILDAH_ISOLATION) already configure everything. These wrappers add
+# explicit CLI flags as a safety net in case env vars are cleared.
 #
-# CRITICAL: Wrappers are at /usr/local/bin/{podman,buildah,docker} which
-# takes priority over /usr/bin/{podman,buildah} in PATH. This ensures
-# that ANY call to 'podman build' or 'buildah bud' from CI workflows
-# automatically gets the right flags.
+# IMPORTANT for buildah 1.23.1:
+#   --storage-driver, --storage-opt ARE global (PersistentFlags)
+#   --isolation is NOT a global flag — it's only valid on subcommands
+#   (bud, from, run). Use BUILDAH_ISOLATION=chroot env var instead.
 #
-# --storage-opt ignore_chown_errors=true is THE fix for:
-#   "lchown /etc/gshadow: invalid argument" in single-UID rootless mode
-RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
+# The VFS driver requires 'vfs.' prefix on options:
+#   Valid:   vfs.ignore_chown_errors=true
+#   Invalid: ignore_chown_errors=true  (causes "does not support" error)
+#
+# We do NOT force --root/--runroot here — storage paths come from
+# CONTAINERS_STORAGE_CONF or the workflow's own storage.conf.
+# This avoids conflicts with workflows that configure their own paths.
+RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/podman && chmod +x /usr/local/bin/podman
 
-RUN printf '#!/bin/sh\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  --isolation=chroot \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
+RUN printf '#!/bin/sh\n# NOTE: --isolation is NOT a global buildah flag.\n# Use BUILDAH_ISOLATION=chroot env var (already set in image).\nexec /usr/bin/buildah \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/buildah && chmod +x /usr/local/bin/buildah
 
-RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --root=/home/runner/.local/share/containers/storage \\\n  --runroot=/tmp/containers-run-1001 \\\n  --storage-opt ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
+RUN printf '#!/bin/sh\nexec /usr/bin/podman \\\n  --storage-driver=vfs \\\n  --storage-opt vfs.ignore_chown_errors=true \\\n  "$@"\n' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker
 
 # ── Validate configs at build time ───────────────────────────────────
 # Quick sanity check: ensure podman can read the config without errors.
 # This runs as root during build but validates TOML parsing.
 RUN /usr/bin/podman --storage-driver=vfs \
+      --storage-opt vfs.ignore_chown_errors=true \
       --root=/tmp/build-validate \
       --runroot=/tmp/build-validate-run \
       info --format '{{.Store.GraphDriverName}}' 2>&1 | head -20 && \

@@ -183,6 +183,127 @@ HOME=/home/runner
 ### Image pushed
 - `docker.io/annepdevops/actions-runner-dind:0.1.3-s390x` — v0.1.3, lchown/ignore_chown_errors fix. Digest: `sha256:53424b8cd54966916d667bfb87149daa11b0fb98d5858b90468e9b1cd8965fbf`. Verified via registry API.
 
+## DinD Rootless Fixes (Phase 6 — v0.1.4, definitive fix via source code deep dive)
+
+### v0.1.3 runtime errors (reported by user)
+1. `vfs driver does not support ignore_chown_errors options` — **FATAL**: VFS driver rejects the option key.
+2. `unknown flag: --isolation` — buildah wrapper's `--isolation=chroot` is NOT a global flag.
+3. `Failed to decode the keys ["network.network_backend"]` from `~/.config/containers/containers.conf` — workflow recreates user-level config with unsupported keys.
+4. Build exits with code 125.
+
+### Root cause analysis (from deep source code reading)
+
+**Why v0.1.3 failed — THREE confirmed root causes:**
+
+1. **`--storage-opt ignore_chown_errors=true` missing `vfs.` prefix:**
+   - VFS driver `Init()` in `drivers/vfs/driver.go` `parseOptions()` only accepts keys `.ignore_chown_errors` and `vfs.ignore_chown_errors`.
+   - `--storage-opt` CLI flag passes the value directly to `DriverOptions` without any prefix transformation.
+   - Result: key=`ignore_chown_errors` doesn't match → **default case returns "vfs driver does not support %s options"**
+   - Fix: `--storage-opt vfs.ignore_chown_errors=true`
+   - NOTE: `[storage.options] ignore_chown_errors = "true"` in TOML config IS correct — `ReloadConfigurationFile()` adds the driver prefix via `fmt.Sprintf("%s.ignore_chown_errors=%s", config.Storage.Driver, ...)` which produces `"vfs.ignore_chown_errors=true"`. The bug was ONLY in the CLI `--storage-opt` wrapper.
+
+2. **`--isolation=chroot` is NOT a global buildah flag:**
+   - Confirmed from buildah v1.23.1 `cmd/buildah/main.go`: global flags are `PersistentFlags` — includes `--root`, `--runroot`, `--storage-driver`, `--storage-opt`, but NOT `--isolation`.
+   - `--isolation` is a subcommand flag for `bud`, `from`, `run`.
+   - When wrapper runs `buildah --isolation=chroot version`, buildah returns "unknown flag: --isolation".
+   - Fix: remove `--isolation` from wrapper, rely on `BUILDAH_ISOLATION=chroot` env var (already set).
+
+3. **`CONTAINERS_CONF` env var not set:**
+   - containers/common v0.44 `pkg/config/config.go` `systemConfigs()`: when `CONTAINERS_CONF` is set, it returns ONLY that path — skips ALL system and user configs.
+   - Without it, podman reads the cascade: `/usr/share/` → `/etc/` → `~/.config/`
+   - Workflow creates `~/.config/containers/containers.conf` with `network_backend` key → "Failed to decode" warning.
+   - Fix: `CONTAINERS_CONF=/etc/containers/containers.conf` forces reading only our clean config.
+
+### Additional env var: STORAGE_OPTS
+- `types/options.go` `ReloadConfigurationFile()`: near the end, checks `os.LookupEnv("STORAGE_OPTS")` and REPLACES all `GraphDriverOptions`.
+- Setting `STORAGE_OPTS=vfs.ignore_chown_errors=true` provides ultimate env-var-level override.
+- For VFS driver, `ignore_chown_errors` is the only needed option, so replacement is safe.
+- This works even if no config file is read.
+
+### TOML config → DriverOptions pipeline (definitive mapping)
+```
+[storage.options] ignore_chown_errors = "true"
+    → ReloadConfigurationFile(): fmt.Sprintf("%s.ignore_chown_errors=%s", driver, val)
+    → "vfs.ignore_chown_errors=true" ✓
+
+[storage.options.vfs] ignore_chown_errors = "true"
+    → GetGraphDriverOptions("vfs", opts): fmt.Sprintf("%s.ignore_chown_errors=%s", driverName, opts.Vfs.IgnoreChownErrors)
+    → "vfs.ignore_chown_errors=true" ✓
+
+--storage-opt ignore_chown_errors=true (CLI)
+    → goes directly to DriverOptions as "ignore_chown_errors=true"
+    → VFS parseOptions: key="ignore_chown_errors" → NO MATCH → ERROR ✗
+
+--storage-opt vfs.ignore_chown_errors=true (CLI)
+    → goes directly to DriverOptions as "vfs.ignore_chown_errors=true"
+    → VFS parseOptions: key="vfs.ignore_chown_errors" → MATCH ✓
+
+STORAGE_OPTS=vfs.ignore_chown_errors=true (env var)
+    → ReloadConfigurationFile() replaces GraphDriverOptions
+    → "vfs.ignore_chown_errors=true" ✓
+```
+
+### 5 key fixes in v0.1.4 (vs v0.1.3)
+
+| # | What changed | Why |
+|---|---|---|
+| 1 | `--storage-opt vfs.ignore_chown_errors=true` (added `vfs.` prefix) | VFS driver requires prefixed key in parseOptions() |
+| 2 | Removed `--isolation=chroot` from buildah wrapper | Not a global flag in buildah 1.23.1; BUILDAH_ISOLATION env var handles this |
+| 3 | Added `CONTAINERS_CONF=/etc/containers/containers.conf` env var | Prevents reading workflow-created containers.conf with unknown TOML keys |
+| 4 | Added `STORAGE_OPTS=vfs.ignore_chown_errors=true` env var | Belt-and-suspenders: env-var-level override independent of config files |
+| 5 | Removed forced `--root`/`--runroot` from wrappers | Prevents conflict with workflow-configured storage paths |
+
+### Key ENV vars in v0.1.4 Dockerfile (9 total)
+```
+BUILDAH_ISOLATION=chroot
+_CONTAINERS_USERNS_CONFIGURED=1
+STORAGE_DRIVER=vfs
+CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf
+CONTAINERS_REGISTRIES_CONF=/etc/containers/registries.conf
+CONTAINERS_CONF=/etc/containers/containers.conf          # NEW in v0.1.4
+STORAGE_OPTS=vfs.ignore_chown_errors=true                # NEW in v0.1.4
+XDG_RUNTIME_DIR=/tmp/xdg-run-1001
+HOME=/home/runner
+```
+
+### Wrapper scripts (v0.1.4)
+```sh
+# /usr/local/bin/podman
+#!/bin/sh
+exec /usr/bin/podman \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+
+# /usr/local/bin/buildah (NO --isolation!)
+#!/bin/sh
+exec /usr/bin/buildah \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+
+# /usr/local/bin/docker
+#!/bin/sh
+exec /usr/bin/podman \
+  --storage-driver=vfs \
+  --storage-opt vfs.ignore_chown_errors=true \
+  "$@"
+```
+
+### Image pushed
+- `docker.io/annepdevops/actions-runner-dind:0.1.4-s390x` — v0.1.4, definitive fix. Digest: `sha256:3ee4bfde6906194d6e26f1a5fc63a50607020f4b797b4c98400dca699a0d7298`. Verified via registry API.
+
+### Research sources (Phase 6)
+- **containers/storage v1.38.2 `drivers/vfs/driver.go`** — VFS `parseOptions()` switch statement: only `.ignore_chown_errors` and `vfs.ignore_chown_errors` accepted
+- **containers/storage v1.38.2 `types/options.go`** — `ReloadConfigurationFile()` adds driver prefix to config-based options; `STORAGE_OPTS` replaces all GraphDriverOptions
+- **containers/storage v1.38.2 `pkg/config/config.go`** — `GetGraphDriverOptions("vfs", ...)` maps `[storage.options.vfs]` to prefixed options
+- **containers/common v0.44.0 `pkg/config/config.go`** — `CONTAINERS_CONF` env var forces single-config-file mode
+- **buildah v1.23.1 `cmd/buildah/main.go`** — global PersistentFlags confirmed (no `--isolation`)
+- Red Hat OpenShift Pipelines docs 1.17 — unprivileged buildah requires `allowPrivilegeEscalation + SETUID/SETGID` OR user namespaces
+- GitLab CI rootless buildah tutorial — same pattern: VFS + chroot + anyuid SCC
+- OneUptime blog (Feb 2026) — all examples use `capabilities: {add: [SETUID, SETGID]}`
+- buildah issue #5744 — maintainer nalind confirms `ignore_chown_errors` handles layer blob extraction
+
 ### Files updated
 - `docker/runner-s390x-dind/Dockerfile` — storage.conf global `[storage.options]` + direct wrapper scripts
 - `.env.example` — `IMAGE_TAG=0.1.3-s390x`
